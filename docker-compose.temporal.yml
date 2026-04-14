@@ -1,0 +1,53 @@
+# Local Temporal + Web UI (official images). Requires Docker Desktop.
+# Run: npm run temporal:up
+#
+# gRPC (for this app):  localhost:7233
+# Web UI (browser):     http://localhost:8080   → namespace "default"
+#
+# Stop: npm run temporal:down
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: playwright-test-temporal-pg
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    # Host 15432 avoids clashing with a local PostgreSQL on 5432
+    ports:
+      - "15432:5432"
+    volumes:
+      - temporal_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    container_name: playwright-test-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.32.0
+    container_name: playwright-test-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+
+volumes:
+  temporal_pg_data:

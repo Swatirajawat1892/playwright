@@ -1,0 +1,42 @@
+{
+  "name": "login-linkedin-using-playwright",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "tsx src/linkedin-login.ts",
+    "playwright:availity": "tsx scripts/run-availity-playwright.ts",
+    "login:ohid": "tsx src/ohid-login.ts",
+    "chrome:cdp": "node --import dotenv/config scripts/run-chrome-cdp.mjs",
+    "chrome:list-profiles": "node scripts/list-chrome-profiles.mjs",
+    "start": "node --import dotenv/config scripts/start-embedded-temporal.js",
+    "start:docker": "node --import dotenv/config scripts/start-with-temporal.js",
+    "start:app": "node --import dotenv/config src/run-app.js",
+    "dev": "node --import dotenv/config src/run-app.js",
+    "temporal:up": "docker compose -f docker-compose.temporal.yml up -d --pull missing && node scripts/temporal-hint.js",
+    "temporal:down": "docker compose -f docker-compose.temporal.yml down",
+    "temporal:logs": "docker compose -f docker-compose.temporal.yml logs -f temporal temporal-ui",
+    "temporal:dev-server": "temporal server start-dev",
+    "worker": "node --import dotenv/config src/worker.js",
+    "api": "node --import dotenv/config src/api-server.js",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.15.0",
+    "@temporalio/client": "^1.15.0",
+    "@temporalio/common": "^1.15.0",
+    "@temporalio/testing": "^1.15.0",
+    "@temporalio/worker": "^1.15.0",
+    "@temporalio/workflow": "^1.15.0",
+    "express": "^4.21.2",
+    "playwright": "^1.49.1",
+    "twilio": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "dotenv": "^16.4.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

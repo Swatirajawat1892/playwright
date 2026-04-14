@@ -1,0 +1,5 @@
+node_modules/
+data/
+.linkedin-session.json
+.availity-session.json
+.env
