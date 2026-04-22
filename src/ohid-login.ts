@@ -20,18 +20,17 @@
  *   OHID_MFA_METHOD=email (default) or sms | OHID_PNM_MFA_CHOOSE_MS (default 8000, how long to wait for that page).
  * - Provider details: expand Self Service via #spanSelfServiceIcon; open Recipient Eligibility via id ending _lnkRecipientEligibilityMITS (falls back to role/link text).
  * - Search Eligibility (SearchEligibility.aspx): optional `medicateSearch` from POST /medicate-availability-check → env OHID_MEDICATE_SEARCH_JSON — scrolls, expands ELIGIBILITY SEARCH if needed, fills billing + DOB + From/To DOS, clicks Search.
+ * - After medicate Search Eligibility (`OHID_MEDICATE_SEARCH_JSON`, with PNM path on): by default the script **ends** right after data scrape + stdout/artifact (`OHID_STOP_AFTER_ELIGIBILITY` defaults true). Set `OHID_STOP_AFTER_ELIGIBILITY=false` to keep post-login `OHID_STAY_MS` / `DASHBOARD_STAY_MS` tail (ATC automation was removed).
+ * - Session file (`.ohid-session.json`): **ATC / atcemr.com** cookies and origins are **removed** on load and save so the browser does not resurrect `atc.atcemr.com` from an old session. CDP mode still uses your full Chrome profile — close ATC tabs there manually if needed.
  * - Speed tuning (optional ms / counts): OHID_GOTO_MS, OHID_NETWORK_IDLE_MS (post-login only), LOGIN_WAIT_MS,
  *   OHID_MY_APPS_LOAD_MS (0 = skip `load` wait on My Apps), OHID_MY_APPS_SECTION_MS, OHID_MY_APPS_NO_SCROLL_POLL_MS, OHID_MY_APPS_SCROLL_*,
  *   OHID_PNM_NAV_RACE_MS, OHID_TERMS_* , OHID_STAY_MS_DEFAULT (override stay with OHID_STAY_MS).
  */
 import "dotenv/config";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-// JS module — see otpStore.js.d.ts (NodeNext + .js import resolution)
-// @ts-expect-error TS module resolution for ./otpStore.js
-import { clearOtp, peekOtp } from "./otpStore.js";
 import {
   chromium,
   type Browser,
@@ -41,7 +40,10 @@ import {
   type Page,
 } from "playwright";
 // ✅ NEW CHANGE
-import { reportManagedCarePlanCompanyMatch } from "./managed-care-plan-match.js";
+import { reportSearchEligibilityPageData } from "./managed-care-plan-match.js";
+import { handleOhidOtpFromStoreIfNeeded } from "./ohid/otp-api.js";
+import { clickPnmLoginWithOhidIfPresent } from "./ohid/pnm-gateway.js";
+import { handlePnmMfaIfPresent } from "./ohid/pnm-mfa.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
@@ -51,6 +53,106 @@ const OHID_LOGIN_URL =
 
 const OHID_MY_APPS_URL =
   process.env.OHID_MY_APPS_URL?.trim() || "https://ohid.ohio.gov/manage-account/my-apps";
+
+function nowStamp(): string {
+  // Filesystem-safe timestamp.
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function ohidRunIdFromEnv(): string {
+  const rid = (process.env.OHID_WORKFLOW_RUN_ID ?? "").trim();
+  return rid && /^[a-zA-Z0-9._-]+$/.test(rid) ? rid : "manual";
+}
+
+function searchEligibilityScreenshotPath(): string {
+  const base = (process.env.OHID_SCREENSHOT_DIR ?? "").trim() || join(PROJECT_ROOT, "data", "ohid-screenshots");
+  const dir = isAbsolute(base) ? base : join(PROJECT_ROOT, base);
+  return join(dir, `search-eligibility-${ohidRunIdFromEnv()}-${nowStamp()}.png`);
+}
+
+function tabsOverviewScreenshotPath(): string {
+  const base = (process.env.OHID_SCREENSHOT_DIR ?? "").trim() || join(PROJECT_ROOT, "data", "ohid-screenshots");
+  const dir = isAbsolute(base) ? base : join(PROJECT_ROOT, base);
+  return join(dir, `tabs-overview-${ohidRunIdFromEnv()}-${nowStamp()}.png`);
+}
+
+async function captureTabsOverviewScreenshot(context: BrowserContext): Promise<string | null> {
+  try {
+    const pages = context.pages().filter((p) => !p.isClosed());
+    const rows: Array<{ title: string; url: string; dataUrl?: string }> = [];
+
+    for (const p of pages) {
+      let url = "";
+      let title = "";
+      try {
+        url = p.url();
+        title = (await p.title().catch(() => "")) || "";
+      } catch {
+        /* ignore */
+      }
+
+      const u = (url || "").trim();
+      if (!u || u === "about:blank") continue;
+      if (u.startsWith("chrome://") || u.startsWith("devtools://") || u.startsWith("chrome-error://")) continue;
+
+      const buf = await p.screenshot({ fullPage: false }).catch(() => null);
+      const dataUrl =
+        buf && Buffer.isBuffer(buf) ? `data:image/png;base64,${buf.toString("base64")}` : undefined;
+      rows.push({ title: title || "(untitled)", url: u, ...(dataUrl ? { dataUrl } : {}) });
+    }
+
+    const overview = await context.newPage();
+    const escapeHtml = (s: string) =>
+      s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    const itemsHtml =
+      rows.length === 0
+        ? `<p style="color:#555">No tabs captured.</p>`
+        : rows
+            .map((r, i) => {
+              const thumb = r.dataUrl
+                ? `<img src="${r.dataUrl}" style="width:100%;max-width:900px;border:1px solid #ddd;border-radius:8px" />`
+                : `<div style="width:100%;max-width:900px;border:1px dashed #bbb;border-radius:8px;padding:12px;color:#666">Thumbnail unavailable</div>`;
+              return `
+                <div style="padding:14px 0;border-top:1px solid #eee">
+                  <div style="font-weight:700;margin-bottom:6px">${i + 1}. ${escapeHtml(r.title)}</div>
+                  <div style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; color:#333; word-break:break-all; margin-bottom:10px">
+                    ${escapeHtml(r.url)}
+                  </div>
+                  ${thumb}
+                </div>
+              `;
+            })
+            .join("\n");
+
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tabs overview</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }
+    h1 { font-size: 18px; margin: 0 0 6px; }
+    .meta { color:#555; font-size: 12px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Tabs overview</h1>
+  <div class="meta">runId: ${escapeHtml(ohidRunIdFromEnv())} • captured: ${escapeHtml(new Date().toISOString())}</div>
+  ${itemsHtml}
+</body>
+</html>`;
+
+    await overview.setContent(html, { waitUntil: "domcontentloaded" });
+    const p = tabsOverviewScreenshotPath();
+    await mkdir(dirname(p), { recursive: true });
+    await overview.screenshot({ path: p, fullPage: true }).catch(() => undefined);
+    await overview.close().catch(() => undefined);
+    return p;
+  } catch {
+    return null;
+  }
+}
 
 /** Non-negative ms from env, or fallback (fast defaults; increase via .env on slow networks). */
 function envMs(name: string, fallback: number): number {
@@ -131,11 +233,38 @@ function requireEnv(name: string): string {
   }
   return v;
 }
-
+ 
 function sessionPath(): string {
   const p = process.env.OHID_SESSION_PATH?.trim();
   if (!p) return join(PROJECT_ROOT, ".ohid-session.json");
   return isAbsolute(p) ? p : join(PROJECT_ROOT, p);
+}
+
+type JsonStorageState = {
+  cookies?: Array<{ domain?: string; [key: string]: unknown }>;
+  origins?: Array<{ origin?: string; [key: string]: unknown }>;
+  [key: string]: unknown;
+};
+
+/** ATC (atc.atcemr.com) was removed from automation; strip its cookies so Chromium does not reopen that site. */
+function stripAtcEmrFromStorageState(state: JsonStorageState): JsonStorageState {
+  const cookies = (state.cookies ?? []).filter((c) => !/atcemr/i.test(String(c.domain ?? "")));
+  const origins = (state.origins ?? []).filter((o) => !/atcemr/i.test(String(o.origin ?? "")));
+  return { ...state, cookies, origins };
+}
+
+async function closeAtcTabsIfAny(context: BrowserContext): Promise<void> {
+  for (const p of [...context.pages()]) {
+    try {
+      const h = new URL(p.url()).hostname;
+      if (/atcemr/i.test(h)) {
+        console.log("[OHID] Closing leftover ATC tab:", p.url());
+        await p.close().catch(() => undefined);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /**
@@ -411,7 +540,7 @@ async function waitForUsEgressThenProceed(
     `Timed out waiting for US IP (${maxWaitMs}ms). Connect to a USA VPN, or set OHID_WAIT_FOR_US_IP=false to skip this check.`,
   );
 }
-
+    
 async function waitPastLoginPage(page: Page, timeoutMs: number): Promise<void> {
   await page.waitForFunction(
     () => {
@@ -426,335 +555,21 @@ async function waitPastLoginPage(page: Page, timeoutMs: number): Promise<void> {
   );
 }
 
-function ohidOtpWorkflowId(): string | undefined {
-  const w = process.env.OHID_WORKFLOW_RUN_ID?.trim() || process.env.OHID_OTP_WORKFLOW_ID?.trim();
-  return w || undefined;
-}
-
-/**
- * After password submit, if an MFA/OTP field appears, poll `otpStore` until POST /ingest-otp delivers a code.
- * Requires OHID_WORKFLOW_RUN_ID (set by Temporal `runOhidLogin`) or OHID_OTP_WORKFLOW_ID for local testing.
- */
-async function handleOhidOtpFromStoreIfNeeded(page: Page): Promise<void> {
-  if (process.env.OHID_OTP_FROM_API === "false") {
-    return;
-  }
-  const workflowId = ohidOtpWorkflowId();
-  if (!workflowId) {
-    console.log(
-      "[OHID] No OHID_WORKFLOW_RUN_ID — skipping Gmail/API OTP (set by Temporal when using POST /start-ohid-login).",
-    );
-    return;
-  }
-
-  const otpInput = page
-    .locator(
-      [
-        'input[inputmode="numeric"]',
-        'input[autocomplete="one-time-code"]',
-        'input[type="tel"]',
-        'input[name*="otp" i]',
-        'input[name*="code" i]',
-        'input[id*="otp" i]',
-        'input[id*="code" i]',
-        'input[aria-label*="code" i]',
-        'input[aria-label*="verification" i]',
-      ].join(", "),
-    )
-    .first();
-
-  const appeared = await otpInput.waitFor({ state: "visible", timeout: OH.otpFieldWait }).catch(() => null);
-  if (!appeared) {
-    console.log("[OHID] No MFA/OTP field in time — continuing (no API OTP).");
-    return;
-  }
-
-  console.log(`[OHID] MFA/OTP field visible — waiting for POST /ingest-otp (workflowId=${workflowId})…`);
-
-  const deadline = Date.now() + OH.otpWait;
-  while (Date.now() < deadline) {
-    const row = await peekOtp(workflowId);
-    if (row?.otp && String(row.otp).trim().length >= 4) {
-      const code = String(row.otp).trim();
-      await otpInput.fill(code);
-      const submit = page.getByRole("button", { name: /verify|continue|submit|next|sign\s*in/i }).first();
-      if ((await submit.count()) > 0) {
-        await submit.click({ timeout: OH.fillAction });
-      } else {
-        await page.locator('button[type="submit"]').first().click({ timeout: OH.fillAction });
-      }
-      await page.waitForLoadState("domcontentloaded", { timeout: 30_000 }).catch(() => undefined);
-      await clearOtp(workflowId).catch(() => undefined);
-      console.log("[OHID] Submitted OTP from API store.");
-      return;
-    }
-    await new Promise<void>((r) => setTimeout(r, OH.otpPoll));
-  }
-
-  throw new Error(
-    `Timed out waiting for OTP (POST /ingest-otp) for workflowId=${workflowId}. Check n8n and OTP_INGEST_API_KEY.`,
-  );
-}
-
-function isPnmAccountLoginUrl(url: string): boolean {
-  try {
-    const u = new URL(url);
-    if (!/\/Account\/Login\.aspx/i.test(u.pathname)) return false;
-    return /ohpnm|omes\.maximus|maximus\.com/i.test(u.hostname);
-  } catch {
-    return false;
-  }
-}
-
-function isPnmMaximusHost(url: string): boolean {
-  try {
-    return /ohpnm|omes\.maximus|maximus\.com/i.test(new URL(url).hostname);
-  } catch {
-    return false;
-  }
-}
-
-/** True once PNM has moved past the optional SSO landing (terms, app, process pages). */
-function isLikelyPastPnmOptionalGateway(url: string): boolean {
-  try {
-    const u = new URL(url);
-    if (!isPnmMaximusHost(url)) return true;
-    if (isPnmAccountLoginUrl(url)) return false;
-    return /\/Process\/|ProviderHome|Terms|ProviderDetails|SearchEligibility|Account\/Logout/i.test(u.pathname);
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Optional PNM step: some sessions land on `/Account/Login.aspx` with "Log in with OH|ID"; others skip
- * straight to terms/app. If the button is visible we click it; otherwise we return immediately.
- * Never throws — the rest of the flow (MFA, terms, medicate) always continues.
- */
-async function clickPnmLoginWithOhidIfPresent(appPage: Page): Promise<void> {
-  try {
-    await appPage.waitForLoadState("domcontentloaded", { timeout: OH.pnmLoadShort }).catch(() => undefined);
-    await new Promise<void>((r) => setTimeout(r, 400));
-
-    const nameStrict = /Log\s*in\s*with\s*OH[\s|│\u007c]*ID/i;
-    const nameLoose = /Log\s*in\s*with\s*OH/i;
-
-    async function pickSsoControl(): Promise<Locator | null> {
-      const candidates: Locator[] = [
-        appPage.getByRole("button", { name: nameStrict }).first(),
-        appPage.getByRole("link", { name: nameStrict }).first(),
-        appPage.getByRole("button", { name: nameLoose }).first(),
-        appPage.getByRole("link", { name: nameLoose }).first(),
-        appPage.locator("a, button, input[type='submit'], input[type='button']").filter({ hasText: nameLoose }).first(),
-      ];
-      for (const loc of candidates) {
-        if ((await loc.count()) === 0) continue;
-        if (await loc.isVisible().catch(() => false)) return loc;
-      }
-      return null;
-    }
-
-    let target: Locator | null = null;
-    const deadline = Date.now() + OH.pnmSsoButton;
-
-    while (Date.now() < deadline && !target) {
-      const url = appPage.url();
-      if (!isPnmMaximusHost(url)) {
-        break;
-      }
-      if (isLikelyPastPnmOptionalGateway(url)) {
-        break;
-      }
-      if (isPnmAccountLoginUrl(url)) {
-        target = await pickSsoControl();
-        if (target) {
-          break;
-        }
-      }
-      await new Promise<void>((r) => setTimeout(r, 250));
-    }
-
-    if (target && !isPnmAccountLoginUrl(appPage.url())) {
-      target = null;
-    }
-
-    if (!target) {
-      console.log("[OHID] Optional PNM OH|ID gateway not used — continuing.");
-      return;
-    }
-
-    console.log("[OHID] Optional PNM gateway — clicking Log in with OH|ID…");
-    await target.scrollIntoViewIfNeeded().catch(() => undefined);
-
-    try {
-      await Promise.all([
-        appPage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: OH.pnmNavRace }).catch(() => null),
-        target.click({ timeout: OH.pnmClick }),
-      ]);
-    } catch {
-      await target.click({ timeout: OH.pnmClick, force: true }).catch(() => undefined);
-    }
-
-    await appPage.waitForLoadState("domcontentloaded", { timeout: OH.pnmLoad }).catch(() => undefined);
-    await new Promise<void>((r) => setTimeout(r, 400));
-
-    console.log("[OHID] After optional PNM SSO gateway. URL:", appPage.url());
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log("[OHID] Optional PNM OH|ID step ignored (continuing):", msg);
-  }
-}
-
-/**
- * After clicking "Open" on PNM, OHID may show a "Two-step verification — Choose a method" page
- * (url contains ohid.verify.ohio.gov/authsvc…macotp…) before reaching the PNM app/Terms page.
- *
- * If that page appears within OH.pnmMfaChoose ms:
- *   1. Click "Send code" (email preferred; set OHID_MFA_METHOD=sms for SMS).
- *   2. Poll the OTP file store (same as POST /ingest-otp) until code arrives.
- *   3. Fill and submit the code.
- *
- * If the page does NOT appear (regular sessions) the function returns immediately and the caller
- * continues to the Terms/acceptance flow unchanged.
- */
-async function handlePnmMfaIfPresent(context: BrowserContext): Promise<void> {
-  const mfaUrlPattern = /ohid\.verify\.ohio\.gov.*authsvc/i;
-  const chooseHeadingPattern = /Choose a method/i;
-  const twoStepPattern = /Two.?step verification/i;
-
-  async function findMfaPage(): Promise<Page | null> {
-    for (const p of context.pages().filter((pg) => !pg.isClosed())) {
-      if (mfaUrlPattern.test(p.url())) {
-        return p;
-      }
-      const heading = p.getByRole("heading", { name: chooseHeadingPattern }).or(
-        p.getByText(twoStepPattern),
-      );
-      if (await heading.first().isVisible({ timeout: 300 }).catch(() => false)) {
-        return p;
-      }
-    }
-    return null;
-  }
-
-  const deadline = Date.now() + OH.pnmMfaChoose;
-  let mfaPage: Page | null = null;
-  while (Date.now() < deadline) {
-    mfaPage = await findMfaPage();
-    if (mfaPage) break;
-    await new Promise<void>((r) => setTimeout(r, 350));
-  }
-
-  if (!mfaPage) {
-    return;
-  }
-
-  const otpWorkflowIdForPnm = ohidOtpWorkflowId();
-  // Without an API OTP workflow id, automated Send code + /ingest-otp cannot complete — let the user finish MFA in the browser.
-  if (!otpWorkflowIdForPnm) {
-    console.warn(
-      "[OHID] Two-step verification detected. No OHID_WORKFLOW_RUN_ID (use POST /start-ohid-login or set OHID_OTP_WORKFLOW_ID) — complete verification in the browser; script will wait for the PNM terms checkbox.",
-    );
-    return;
-  }
-
-  console.log("[OHID] Two-step verification (Choose a method) detected — clicking Send code…");
-
-  const preferMethod = (process.env.OHID_MFA_METHOD ?? "email").toLowerCase();
-
-  // "Send code" links are inline with Email / Text message rows.
-  // Strategy: find the row that contains the preferred method text, pick its "Send code" link.
-  const emailSend = mfaPage
-    .locator("*")
-    .filter({ hasText: /^Email$/i })
-    .locator("xpath=following::a[1]")
-    .filter({ hasText: /Send code/i })
-    .first();
-  const smsSend = mfaPage
-    .locator("*")
-    .filter({ hasText: /^Text message$/i })
-    .locator("xpath=following::a[1]")
-    .filter({ hasText: /Send code/i })
-    .first();
-  // Fallback: any "Send code" link on the page (first = email in the screenshot).
-  const anySend = mfaPage.getByRole("link", { name: /Send code/i }).first();
-
-  const sendCandidates =
-    preferMethod === "sms"
-      ? [smsSend, emailSend, anySend]
-      : [emailSend, smsSend, anySend];
-
-  let sent = false;
-  for (const c of sendCandidates) {
-    try {
-      if ((await c.count()) === 0) continue;
-      await c.click({ timeout: 8_000 });
-      sent = true;
-      console.log("[OHID] Send code clicked.");
-      break;
-    } catch {
-      // try next candidate
-    }
-  }
-  if (!sent) {
-    console.warn("[OHID] Could not click Send code — attempting to continue anyway.");
-  }
-
-  // OTP input appears on the same page after "Send code".
-  const otpInput = mfaPage
-    .locator(
-      [
-        'input[inputmode="numeric"]',
-        'input[autocomplete="one-time-code"]',
-        'input[type="tel"]',
-        'input[name*="otp" i]',
-        'input[name*="code" i]',
-        'input[id*="otp" i]',
-        'input[id*="code" i]',
-        'input[aria-label*="code" i]',
-        'input[aria-label*="verification" i]',
-      ].join(", "),
-    )
-    .first();
-
-  await otpInput.waitFor({ state: "visible", timeout: OH.otpFieldWait });
-  console.log("[OHID] OTP input visible on MFA page.");
-
-  console.log(`[OHID] Waiting for OTP from POST /ingest-otp (workflowId=${otpWorkflowIdForPnm})…`);
-
-  const otpDeadline = Date.now() + OH.otpWait;
-  while (Date.now() < otpDeadline) {
-    const row = await peekOtp(otpWorkflowIdForPnm);
-    if (row?.otp && String(row.otp).trim().length >= 4) {
-      const code = String(row.otp).trim();
-      await otpInput.fill(code);
-
-      const submitBtn = mfaPage
-        .getByRole("button", { name: /verify|continue|submit|next|sign[\s-]*in/i })
-        .first();
-      if ((await submitBtn.count()) > 0) {
-        await submitBtn.click({ timeout: OH.fillAction });
-      } else {
-        await mfaPage.locator('button[type="submit"]').first().click({ timeout: OH.fillAction });
-      }
-
-      await mfaPage
-        .waitForLoadState("domcontentloaded", { timeout: 30_000 })
-        .catch(() => undefined);
-      await clearOtp(otpWorkflowIdForPnm).catch(() => undefined);
-      console.log("[OHID] PNM MFA OTP submitted — continuing to Terms page…");
-      return;
-    }
-    await new Promise<void>((r) => setTimeout(r, OH.otpPoll));
-  }
-
-  throw new Error(
-    `[OHID] Timed out waiting for OTP (POST /ingest-otp) for PNM two-step verification. workflowId=${otpWorkflowIdForPnm}`,
-  );
-}
-
 function shouldOpenProviderNetworkAfterLogin(): boolean {
   return process.env.OHID_OPEN_PNM !== "false";
+}
+
+/**
+ * When `OHID_MEDICATE_SEARCH_JSON` is set, eligibility data is emitted inside `fillSearchEligibilityIfConfigured`.
+ * Default: stop the run after that (session snapshot only) — no post-login stay in `main`.
+ * Set `OHID_STOP_AFTER_ELIGIBILITY=false` for the previous long-running tail behavior.
+ */
+function shouldStopAfterSearchEligibility(): boolean {
+  const hasMedicate = !!(process.env.OHID_MEDICATE_SEARCH_JSON?.trim());
+  if (!hasMedicate) return false;
+  // Search Eligibility fill/scrape only runs inside `openProviderNetworkAndAcceptTerms`.
+  if (!shouldOpenProviderNetworkAfterLogin()) return false;
+  return (process.env.OHID_STOP_AFTER_ELIGIBILITY ?? "true").trim().toLowerCase() !== "false";
 }
 
 /** My Apps often scrolls inside a div, not `window` — move the main scrollable region. */
@@ -1468,16 +1283,19 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
   // ── 2. Date of Birth ─────────────────────────────────────────────────────
   const dobLoc = formPage.locator("#txtDOB, [id$='txtDOB']").first();
   await dobLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+  // Date strings are forwarded to the OHID UI as entered (expected mm/dd/yyyy).
   await fillField(dobLoc, cfg.dateOfBirth, "txtDOB");
 
   // ── 3. From DOS ──────────────────────────────────────────────────────────
   const fromLoc = formPage.locator("#txtFDOS, [id$='txtFDOS']").first();
   await fromLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+  // Expected mm/dd/yyyy.
   await fillField(fromLoc, cfg.fromDos, "txtFDOS");
 
   // ── 4. To DOS ────────────────────────────────────────────────────────────
   const toLoc = formPage.locator("#txtTDOS, [id$='txtTDOS']").first();
   await toLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+  // Expected mm/dd/yyyy.
   await fillField(toLoc, cfg.toDos, "txtTDOS");
 
   await new Promise<void>((r) => setTimeout(r, 300));
@@ -1492,6 +1310,146 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
   await formPage.waitForLoadState("domcontentloaded", { timeout: OH.medicateAfterSearch }).catch(() => undefined);
   console.log("[OHID] Search Eligibility done. URL:", formPage.url());
 
+  async function expandAccordionIfCollapsed(titleRe: RegExp, contentWait?: Locator): Promise<void> {
+    // Keep this bounded: never hang the whole run on a flaky accordion.
+    const titleLabel = String(titleRe).replace(/^\/|\/[gimsuy]*$/g, "");
+
+    const containerHandle = await formPage.evaluateHandle(({ source, flags }) => {
+      const re = new RegExp(source, flags);
+      const normalize = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>("a, button, div, span, td, th"));
+      const titleEl =
+        candidates.find((el) => re.test(el.innerText || el.textContent || "")) ??
+        candidates.find((el) => re.test(normalize(el.innerText || el.textContent || "")));
+      if (!titleEl) return null;
+
+      const iconLike = (el: Element | null | undefined) => {
+        if (!el) return false;
+        const t = (el.textContent || "").trim();
+        return t === "+" || t === "-";
+      };
+
+      let container: HTMLElement | null =
+        (titleEl.closest("tr") as HTMLElement | null) ||
+        (titleEl.closest("div") as HTMLElement | null) ||
+        (titleEl.parentElement as HTMLElement | null);
+      for (let i = 0; i < 8 && container; i++) {
+        const hasIcon = Array.from(container.querySelectorAll("*")).some((n) => iconLike(n));
+        if (hasIcon) break;
+        container = container.parentElement as HTMLElement | null;
+      }
+      return container;
+    }, { source: titleRe.source, flags: titleRe.flags });
+
+    const containerEl = containerHandle.asElement();
+    if (!containerEl) return;
+
+    const state = await formPage
+      .evaluate((el) => {
+        const iconLike = (n: Element | null | undefined) => {
+          if (!n) return false;
+          const t = (n.textContent || "").trim();
+          return t === "+" || t === "-";
+        };
+        const icons = Array.from(el.querySelectorAll("*")).filter((n) => iconLike(n));
+        const hasPlus = icons.some((n) => (n.textContent || "").trim() === "+");
+        const hasMinus = icons.some((n) => (n.textContent || "").trim() === "-");
+        return { hasPlus, hasMinus };
+      }, containerEl)
+      .catch(() => null);
+
+    if (!state) return;
+    if (state.hasMinus && !state.hasPlus) return; // expanded
+    if (!state.hasPlus && !state.hasMinus) return; // unknown; don't toggle blindly
+
+    await containerEl.scrollIntoViewIfNeeded().catch(() => undefined);
+    await containerEl.click({ timeout: 10_000 }).catch(() => undefined);
+
+    const expanded = await formPage
+      .waitForFunction(
+        ({ source, flags }) => {
+          const re = new RegExp(source, flags);
+          const normalize = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+          const candidates = Array.from(document.querySelectorAll<HTMLElement>("a, button, div, span, td, th"));
+          const titleEl =
+            candidates.find((el) => re.test(el.innerText || el.textContent || "")) ??
+            candidates.find((el) => re.test(normalize(el.innerText || el.textContent || "")));
+          if (!titleEl) return true;
+
+          const iconLike = (el: Element | null | undefined) => {
+            if (!el) return false;
+            const t = (el.textContent || "").trim();
+            return t === "+" || t === "-";
+          };
+
+          let container: HTMLElement | null =
+            (titleEl.closest("tr") as HTMLElement | null) ||
+            (titleEl.closest("div") as HTMLElement | null) ||
+            (titleEl.parentElement as HTMLElement | null);
+          for (let i = 0; i < 8 && container; i++) {
+            const hasIcon = Array.from(container.querySelectorAll("*")).some((n) => iconLike(n));
+            if (hasIcon) break;
+            container = container.parentElement as HTMLElement | null;
+          }
+          if (!container) return true;
+          const icons = Array.from(container.querySelectorAll("*")).filter((n) => iconLike(n));
+          const hasPlus = icons.some((n) => (n.textContent || "").trim() === "+");
+          const hasMinus = icons.some((n) => (n.textContent || "").trim() === "-");
+          return hasMinus && !hasPlus;
+        },
+        { source: titleRe.source, flags: titleRe.flags },
+        { timeout: 12_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    if (!expanded) {
+      console.warn(`[OHID] Accordion did not confirm expanded within timeout: ${titleLabel}`);
+      return;
+    }
+
+    if (contentWait) {
+      await contentWait.waitFor({ state: "visible", timeout: 12_000 }).catch(() => undefined);
+    }
+  }
+
+  async function expandAllEligibilityAccordions(): Promise<void> {
+    // Expand all major accordion sections shown on SearchEligibility.aspx.
+    // We key off the visible "+" icon: if present, the panel is collapsed.
+    const benefitTable = formPage
+      .locator("table")
+      .filter({ has: formPage.locator("th, td").filter({ hasText: /Benefit\s*\/\s*Assignment\s*Plan/i }) })
+      .first();
+    const managedTable = formPage
+      .locator("table")
+      .filter({ has: formPage.locator("th, td").filter({ hasText: /^Plan\s*Name$/i }) })
+      .first();
+
+    const sections: Array<{ re: RegExp; wait?: Locator }> = [
+      { re: /RECIPIENT\s+INFORMATION/i },
+      { re: /BENEFIT\s*\/\s*ASSIGNMENT\s*PLAN/i, wait: benefitTable },
+      { re: /MANAGED\s+CARE\s+PLANS/i, wait: managedTable },
+      { re: /THIRD\s+PARTY\s+LIABILITY/i },
+      { re: /PATIENT\s+LIABILITY/i },
+      { re: /LONG\s+TERM\s+CARE\s+FACILITY\s+PLACEMENTS/i },
+      { re: /\bLOCK\s*IN\b/i },
+      { re: /\bMEDICARE\b/i },
+      { re: /SERVICE\s+LIMITATION/i },
+      { re: /RESTRICTED\s+COVERAGE/i },
+      { re: /ASSOCIATED\s+CHILD/i },
+    ];
+
+    for (const s of sections) {
+      await expandAccordionIfCollapsed(s.re, s.wait);
+    }
+  }
+
+  console.log("[OHID] Expanding all accordion panels before screenshot…");
+  await expandAllEligibilityAccordions().catch((e) => {
+    console.warn("[OHID] Could not expand all panels (continuing):", e instanceof Error ? e.message : e);
+  });
+
   const holdMs = OH.medicateHoldAfterSearch;
   if (holdMs > 0) {
     console.log(`[OHID] Holding ${(holdMs / 1000).toFixed(0)}s on results before Playwright exits…`);
@@ -1499,10 +1457,30 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
     console.log("[OHID] Hold complete.");
   }
 
-  // ✅ NEW CHANGE: Managed Care Plans — Plan Name vs medicateSearch.companyName (stdout marker for Temporal activity)
-  await reportManagedCarePlanCompanyMatch(formPage, cfg).catch((e) => {
-    console.error("[OHID] reportManagedCarePlanCompanyMatch:", e instanceof Error ? e.message : e);
+  // BENEFIT/ASSIGNMENT + MANAGED CARE tables → JSON stdout marker for Temporal workflow result
+  await reportSearchEligibilityPageData(formPage, cfg).catch((e) => {
+    console.error("[OHID] reportSearchEligibilityPageData:", e instanceof Error ? e.message : e);
+    return null;
   });
+
+  // After expanding everything, capture the final Search Eligibility screen (full page).
+  try {
+    const p = searchEligibilityScreenshotPath();
+    await mkdir(dirname(p), { recursive: true });
+    await formPage.screenshot({ path: p, fullPage: true }).catch(() => undefined);
+    console.log("[OHID] Saved Search Eligibility screenshot:", p);
+
+    // Also capture a "tabs overview" (titles + URLs + thumbnails) to show what was open at this moment.
+    const tabsShot = await captureTabsOverviewScreenshot(formPage.context());
+    if (tabsShot) {
+      console.log("[OHID] Saved tabs overview screenshot:", tabsShot);
+    }
+  } catch (e) {
+    console.warn(
+      "[OHID] Could not write Search Eligibility screenshot (continuing):",
+      e instanceof Error ? e.message : e,
+    );
+  }
 }
 
 async function expandSelfServiceAndOpenRecipientEligibility(appPage: Page): Promise<void> {
@@ -1779,10 +1757,10 @@ async function openProviderNetworkAndAcceptTerms(page: Page, context: BrowserCon
   }
 
   // PNM may show /Account/Login.aspx with "Log in with OH|ID" before OHID redirect / terms.
-  await clickPnmLoginWithOhidIfPresent(appPage);
+  await clickPnmLoginWithOhidIfPresent(appPage, OH);
 
   // Handle optional OHID "Two-step verification — Choose a method" that appears before the PNM app.
-  await handlePnmMfaIfPresent(context);
+  await handlePnmMfaIfPresent(context, OH);
 
   appPage = await pageWithTermsCheckbox(context, pnmAppUrl, OH.termsVisible);
 
@@ -1806,6 +1784,21 @@ async function openProviderNetworkAndAcceptTerms(page: Page, context: BrowserCon
   await clickProviderRegIdIfConfigured(appPage);
   await expandSelfServiceAndOpenRecipientEligibility(appPage);
   await fillSearchEligibilityIfConfigured(appPage);
+}
+
+async function persistOhidSession(context: BrowserContext, pageForLog: Page): Promise<void> {
+  await closeAtcTabsIfAny(context);
+  const finalPath = sessionPath();
+  await mkdir(dirname(finalPath), { recursive: true });
+  const state = await context.storageState();
+  const cleaned = stripAtcEmrFromStorageState(state);
+  await writeFile(finalPath, JSON.stringify(cleaned, null, 2), "utf8");
+  console.log("OHID flow completed. Session saved (ATC / atcemr cookies stripped):", finalPath);
+  try {
+    console.log("Current URL:", pageForLog.url());
+  } catch {
+    /* page may be detached */
+  }
 }
 
 async function main(): Promise<void> {
@@ -1868,8 +1861,15 @@ async function main(): Promise<void> {
     const sessionExists = existsSync(sPath);
     const ctxOpts = proxy ? { proxy } : {};
     if (sessionExists) {
-      console.log("[Session] Loading saved session from", sPath);
-      context = await browser.newContext({ ...ctxOpts, storageState: sPath });
+      console.log("[Session] Loading saved session from", sPath, "(stripping any ATC / atcemr cookies)");
+      let storageState: BrowserContextOptions["storageState"] = sPath;
+      try {
+        const raw = JSON.parse(await readFile(sPath, "utf8")) as JsonStorageState;
+        storageState = stripAtcEmrFromStorageState(raw) as NonNullable<BrowserContextOptions["storageState"]>;
+      } catch (e) {
+        console.warn("[Session] Could not parse session JSON; loading path as-is:", e instanceof Error ? e.message : e);
+      }
+      context = await browser.newContext({ ...ctxOpts, storageState });
     } else {
       context = await browser.newContext(ctxOpts);
     }
@@ -1911,7 +1911,7 @@ async function main(): Promise<void> {
         throw err;
       }
 
-      await handleOhidOtpFromStoreIfNeeded(page);
+      await handleOhidOtpFromStoreIfNeeded(page, OH);
 
       await waitPastLoginPage(page, loginWaitMs).catch(async () => {
         const url = page.url();
@@ -1929,13 +1929,15 @@ async function main(): Promise<void> {
       await openProviderNetworkAndAcceptTerms(page, context);
     }
 
-    const url = page.url();
-    const finalPath = sessionPath();
-    await mkdir(dirname(finalPath), { recursive: true });
-    await context.storageState({ path: finalPath });
+    if (shouldStopAfterSearchEligibility()) {
+      console.log(
+        "[OHID] Stopping after Search Eligibility (data already emitted). Set OHID_STOP_AFTER_ELIGIBILITY=false for post-login stay only.",
+      );
+      await persistOhidSession(context, page);
+      return;
+    }
 
-    console.log("OHID flow completed. Session saved:", finalPath);
-    console.log("Current URL:", url);
+    await persistOhidSession(context, page);
 
     const stayMs = postLoginStayMs();
     if (stayMs > 0) {

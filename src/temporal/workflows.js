@@ -119,7 +119,7 @@ export async function availityLoginWorkflow(_input) {
  *     companyName?: string;
  *   };
  * } | Record<string, never>} input
- * @returns {Promise<{ ok: true, attempts: 1, eligibilityCompanyMatch?: object | null }>}
+ * @returns {Promise<{ ok: true, attempts: 1, searchEligibility?: object | null, eligibilityCompanyMatch?: object | null }>}
  */
 export async function ohidLoginWorkflow(input) {
   const runId = typeof input?.runId === "string" ? input.runId : workflowInfo().workflowId;
@@ -148,14 +148,24 @@ export async function ohidLoginWorkflow(input) {
     inputCompanyName: medicateSearch?.companyName ?? null,
   });
 
-  // ✅ NEW CHANGE: Capture activity return (includes eligibilityCompanyMatch when present)
   const __ohidActivityResult = await runOhidLogin({ runId, medicateSearch });
   log.info("ohidLoginWorkflow: runOhidLogin completed");
 
-  // ✅ NEW CHANGE: Workflow result log (Temporal UI)
-  const __em = __ohidActivityResult?.eligibilityCompanyMatch;
-  if (__em != null) {
-    log.info("Workflow result", {
+  const __se = __ohidActivityResult?.searchEligibility ?? null;
+  const __em =
+    __ohidActivityResult?.eligibilityCompanyMatch ??
+    (__se && typeof __se === "object" ? __se.companyMatch : null) ??
+    null;
+
+  if (__se != null && typeof __se === "object") {
+    log.info("Workflow result (Search Eligibility JSON)", {
+      benefitAssignmentPlans: __se.benefitAssignmentPlans?.length ?? 0,
+      managedCarePlans: __se.managedCarePlans?.length ?? 0,
+      extractionWarnings: __se.extractionWarnings ?? null,
+    });
+  }
+  if (__em != null && typeof __em === "object") {
+    log.info("Workflow result (company match)", {
       match: __em.match,
       inputCompanyName: __em.inputCompanyName,
       uiCompanyName: __em.uiCompanyName,
@@ -164,10 +174,10 @@ export async function ohidLoginWorkflow(input) {
     });
   }
 
-  // ✅ NEW CHANGE: Returned to client.workflow.execute / visible in Result tab
   return {
     ok: true,
     attempts: 1,
+    searchEligibility: __se ?? null,
     eligibilityCompanyMatch: __em ?? null,
   };
 }

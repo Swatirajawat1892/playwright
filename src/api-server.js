@@ -6,6 +6,7 @@
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import express from "express";
+import rateLimit from "express-rate-limit";
 import { Client, Connection, WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
 import { WorkflowIdReusePolicy } from "@temporalio/common";
 import { randomUUID } from "node:crypto";
@@ -32,6 +33,40 @@ const TEMPORAL_NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default";
 const TASK_QUEUE = process.env.TEMPORAL_TASK_QUEUE ?? "availity-login";
 /** Embedded `npm start` sets this to :8233. Docker UI is often :8080 — override in .env. */
 const TEMPORAL_UI_URL = (process.env.TEMPORAL_UI_URL ?? "http://localhost:8233").replace(/\/$/, "");
+
+const IS_PROD = process.env.NODE_ENV === "production";
+const API_HOST = process.env.API_HOST?.trim() || (IS_PROD ? "0.0.0.0" : "127.0.0.1");
+
+function isLocalBindHost(host) {
+  const h = String(host ?? "").trim();
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
+function allowOpenDevAuth() {
+  // Explicit opt-in for "no API keys" mode (local-only workflows).
+  return (process.env.API_ALLOW_OPEN_DEV || "").trim().toLowerCase() === "true";
+}
+
+/** @param {string} name */
+function requireEnv(name) {
+  const v = process.env[name]?.trim();
+  if (!v) {
+    throw new Error(`${name} must be set.`);
+  }
+}
+
+// Production: always require keys.
+if (IS_PROD) {
+  requireEnv("OHID_HTTP_API_KEY");
+  requireEnv("OTP_INGEST_API_KEY");
+}
+
+// Non-production: if binding beyond localhost, require keys unless API_ALLOW_OPEN_DEV=true.
+// (Do not use a prod-only helper here — it would no-op and leave LAN binds open without keys.)
+if (!IS_PROD && !isLocalBindHost(API_HOST) && !allowOpenDevAuth()) {
+  requireEnv("OHID_HTTP_API_KEY");
+  requireEnv("OTP_INGEST_API_KEY");
+}
 
 /**
  * @param {"starting" | "ready"} phase
@@ -82,9 +117,30 @@ async function getClient() {
 
 export const app = express();
 
+// Basic header hygiene (small win, low risk).
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  next();
+});
+
 app.use("/webhook", twilioWebhookRouter);
 
-app.use(express.json());
+// Prevent memory blowups from unbounded JSON bodies.
+app.use(express.json({ limit: process.env.API_JSON_LIMIT?.trim() || "32kb" }));
+
+// Global low-cost rate limit (keeps dev friendly; production can override via env).
+const GLOBAL_RPM = Math.max(0, Number(process.env.API_RATE_LIMIT_RPM ?? (IS_PROD ? "600" : "0")));
+if (GLOBAL_RPM > 0) {
+  app.use(
+    rateLimit({
+      windowMs: 60_000,
+      max: GLOBAL_RPM,
+      standardHeaders: true,
+      legacyHeaders: false,
+    }),
+  );
+}
 
 /**
  * Optional `medicateSearch` on POST /medicate-availability-check — forwarded to OHID Playwright (Search Eligibility form).
@@ -100,22 +156,39 @@ function parseMedicateSearchBody(body) {
     return { ok: false, error: "medicateSearch must be an object" };
   }
   const o = /** @type {Record<string, unknown>} */ (ms);
-  const medicaidBillingNumber = String(o.medicaidBillingNumber ?? "").trim();
-  const dateOfBirth = String(o.dateOfBirth ?? "").trim();
-  const fromDos = String(o.fromDos ?? "").trim();
-  const toDos = String(o.toDos ?? "").trim();
-  const companyName = String(o.companyName ?? "").trim();
-  if (!medicaidBillingNumber || !dateOfBirth || !fromDos || !toDos) {
+  const medicaidBillingNumber =
+    typeof o.medicaidBillingNumber === "string" ? o.medicaidBillingNumber.trim() : "";
+  const dateOfBirth = typeof o.dateOfBirth === "string" ? o.dateOfBirth.trim() : "";
+  const fromDos = typeof o.fromDos === "string" ? o.fromDos.trim() : "";
+  const toDos = typeof o.toDos === "string" ? o.toDos.trim() : "";
+  const companyName = typeof o.companyName === "string" ? o.companyName.trim() : "";
+
+  // Target UI expects US format (OHID / PNM forms): mm/dd/yyyy (no timezone handling here; strings are forwarded as-is).
+  const mmddyyyy = /^(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/\d{4}$/;
+  const maxLen = (s, n) => (s.length <= n ? s : s.slice(0, n));
+  const billing = maxLen(medicaidBillingNumber, 32);
+  const dob = maxLen(dateOfBirth, 10);
+  const from = maxLen(fromDos, 10);
+  const to = maxLen(toDos, 10);
+  const company = maxLen(companyName, 120);
+
+  if (!billing || !dob || !from || !to) {
     return {
       ok: false,
       error:
         "medicateSearch requires all of: medicaidBillingNumber, dateOfBirth, fromDos, toDos (non-empty strings; dates as mm/dd/yyyy). Optional: companyName.",
     };
   }
+  if (!mmddyyyy.test(dob) || !mmddyyyy.test(from) || !mmddyyyy.test(to)) {
+    return {
+      ok: false,
+      error: "dateOfBirth, fromDos, and toDos must be in mm/dd/yyyy format.",
+    };
+  }
   /** @type {{ medicaidBillingNumber: string, dateOfBirth: string, fromDos: string, toDos: string, companyName?: string }} */
-  const value = { medicaidBillingNumber, dateOfBirth, fromDos, toDos };
-  if (companyName) {
-    value.companyName = companyName;
+  const value = { medicaidBillingNumber: billing, dateOfBirth: dob, fromDos: from, toDos: to };
+  if (company) {
+    value.companyName = company;
   }
   return { ok: true, value };
 }
@@ -127,6 +200,19 @@ function parseMedicateSearchBody(body) {
 function assertOhidApiKey(req, res) {
   const key = process.env.OHID_HTTP_API_KEY?.trim();
   if (!key) {
+    if (IS_PROD) {
+      // Should be impossible due to startup guard, but fail closed anyway.
+      res.status(503).json({ ok: false, error: "Server misconfigured: OHID_HTTP_API_KEY is required." });
+      return false;
+    }
+    if (!isLocalBindHost(API_HOST) && !allowOpenDevAuth()) {
+      res.status(503).json({
+        ok: false,
+        error:
+          "OHID_HTTP_API_KEY is required when API_HOST is not localhost. Set OHID_HTTP_API_KEY / OTP_INGEST_API_KEY, bind API_HOST=127.0.0.1, or set API_ALLOW_OPEN_DEV=true (explicit opt-in).",
+      });
+      return false;
+    }
     return true;
   }
   const x = req.get("x-api-key");
@@ -151,6 +237,18 @@ function assertOhidApiKey(req, res) {
 function assertOtpIngestApiKey(req, res) {
   const key = process.env.OTP_INGEST_API_KEY?.trim();
   if (!key) {
+    if (IS_PROD) {
+      res.status(503).json({ ok: false, error: "Server misconfigured: OTP_INGEST_API_KEY is required." });
+      return false;
+    }
+    if (!isLocalBindHost(API_HOST) && !allowOpenDevAuth()) {
+      res.status(503).json({
+        ok: false,
+        error:
+          "OTP_INGEST_API_KEY is required when API_HOST is not localhost. Set keys, bind API_HOST=127.0.0.1, or set API_ALLOW_OPEN_DEV=true (explicit opt-in).",
+      });
+      return false;
+    }
     return true;
   }
   const x = req.get("x-api-key");
@@ -240,9 +338,59 @@ app.post("/ohid-login", (req, res) => {
   });
 });
 
+// Rate-limit risky endpoints (cheap DoS protection).
+const ingestOtpLimiter = rateLimit({
+  windowMs: 60_000,
+  max: Math.max(1, Number(process.env.OTP_INGEST_RPM ?? (IS_PROD ? "30" : "120"))),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const awaitResultLimiter = rateLimit({
+  windowMs: 60_000,
+  max: Math.max(1, Number(process.env.OHID_AWAIT_RESULT_RPM ?? (IS_PROD ? "2" : "10"))),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+let awaitResultInFlight = 0;
+const MAX_AWAIT_IN_FLIGHT = Math.max(
+  1,
+  Number(process.env.OHID_AWAIT_RESULT_MAX_IN_FLIGHT ?? (IS_PROD ? "2" : "10")),
+);
+
+function tryAcquireAwaitSlot(res) {
+  if (awaitResultInFlight >= MAX_AWAIT_IN_FLIGHT) {
+    res.status(429).json({
+      ok: false,
+      error: `Too many in-flight await-result requests (max ${MAX_AWAIT_IN_FLIGHT}). Try again later.`,
+    });
+    return false;
+  }
+  awaitResultInFlight += 1;
+  return true;
+}
+
+function releaseAwaitSlot() {
+  awaitResultInFlight = Math.max(0, awaitResultInFlight - 1);
+}
+
 app.get("/ohid-last", (_req, res) => {
+  // This endpoint can leak stdoutTail (PII / internal URLs). Require the OHID key when configured.
+  if (!assertOhidApiKey(_req, res)) {
+    return;
+  }
   const last = globalThis.__OHID_LAST_ACTIVITY__;
-  res.json({ ok: true, last: last ?? null });
+  if (!last) {
+    res.json({ ok: true, last: null });
+    return;
+  }
+
+  // Never expose raw stdout/stderr tails over HTTP.
+  // Keep structure stable for clients that use this endpoint for status.
+  // eslint-disable-next-line no-unused-vars
+  const { stdoutTail, stderrTail, ...safe } = last;
+  res.json({ ok: true, last: safe });
 });
 
 
@@ -414,6 +562,9 @@ app.get("/medicate-availability-check", (_req, res) => {
 });
 
 app.post("/medicate-availability-check", async (req, res) => {
+  if (!assertOhidApiKey(req, res)) {
+    return;
+  }
   try {
     const parsed = parseMedicateSearchBody(req.body);
     if (!parsed.ok) {
@@ -504,11 +655,16 @@ app.post("/medicate-availability-check", async (req, res) => {
 });
 
 // ✅ NEW CHANGE: Blocks until workflow completes; HTTP body includes workflow result (eligibilityCompanyMatch).
-app.post("/medicate-availability-check-await-result", async (req, res) => {
+app.post("/medicate-availability-check-await-result", awaitResultLimiter, async (req, res) => {
+  if (!tryAcquireAwaitSlot(res)) return;
   try {
     const parsed = parseMedicateSearchBody(req.body);
     if (!parsed.ok) {
       res.status(400).json({ ok: false, error: parsed.error });
+      return;
+    }
+
+    if (!assertOhidApiKey(req, res)) {
       return;
     }
 
@@ -546,6 +702,8 @@ app.post("/medicate-availability-check-await-result", async (req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error("medicate-availability-check-await-result error:", message);
     res.status(500).json({ ok: false, error: message });
+  } finally {
+    releaseAwaitSlot();
   }
 });
 
@@ -571,7 +729,7 @@ app.get("/otp-status", async (req, res) => {
  * - { "text": "Your code is 123456" }  (6-digit code extracted)
  * workflowId: body, query ?workflowId=, or last active id from POST /start-ohid-login.
  */
-app.post("/ingest-otp", async (req, res) => {
+app.post("/ingest-otp", ingestOtpLimiter, async (req, res) => {
   if (!assertOtpIngestApiKey(req, res)) {
     return;
   }
@@ -584,7 +742,7 @@ app.post("/ingest-otp", async (req, res) => {
       typeof req.body?.workflowId === "string" && req.body.workflowId.trim() !== ""
         ? req.body.workflowId.trim()
         : null;
-    let workflowId = fromBody ?? q ?? (await getActiveOhidWorkflowId());
+    const explicitWorkflowId = fromBody ?? q ?? null;
 
     const rawOtp =
       typeof req.body?.otp === "number" && Number.isFinite(req.body.otp)
@@ -619,13 +777,26 @@ app.post("/ingest-otp", async (req, res) => {
       return;
     }
 
+    // Prevent misrouting OTPs under concurrency. In production, workflowId must be explicit.
+    // Dev/local keeps the old behavior to avoid changing your current flow.
+    let workflowId = explicitWorkflowId;
     if (!workflowId) {
-      res.status(409).json({
-        ok: false,
-        error:
-          "No workflowId. Pass ?workflowId= or JSON workflowId, or start OHID with POST /start-ohid-login so an active OHID workflow id is registered.",
-      });
-      return;
+      if (IS_PROD) {
+        res.status(400).json({
+          ok: false,
+          error: "workflowId is required in production (query ?workflowId= or JSON workflowId).",
+        });
+        return;
+      }
+      workflowId = await getActiveOhidWorkflowId();
+      if (!workflowId) {
+        res.status(409).json({
+          ok: false,
+          error:
+            "No workflowId. Pass ?workflowId= or JSON workflowId, or start OHID so an active OHID workflow id is registered.",
+        });
+        return;
+      }
     }
 
     await storeOtpForWorkflow(workflowId, otp);
@@ -716,13 +887,13 @@ export function startApiServer(preferredPort = PORT) {
 
     function attempt() {
       const server = app
-        .listen(port, () => {
+        .listen(port, API_HOST, () => {
           if (port !== preferredPort) {
             console.warn(
               `[API] Port ${preferredPort} is in use (EADDRINUSE). Using ${port} instead. Set API_PORT=${port} in .env or stop the other app.`,
             );
           }
-          console.log(`API listening on http://localhost:${port}`);
+          console.log(`API listening on http://${API_HOST}:${port}`);
           const grpcLabel =
             globalThis.__TEMPORAL_INJECTED__?.connection != null
               ? "embedded"
