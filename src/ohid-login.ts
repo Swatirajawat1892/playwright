@@ -1458,23 +1458,45 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
   }
 
   // BENEFIT/ASSIGNMENT + MANAGED CARE tables → JSON stdout marker for Temporal workflow result
-  await reportSearchEligibilityPageData(formPage, cfg).catch((e) => {
+  // Capture return value so we can use recipientInformation.firstNameMi for the screenshot name.
+  const eligibilityPayload = await reportSearchEligibilityPageData(formPage, cfg).catch((e) => {
     console.error("[OHID] reportSearchEligibilityPageData:", e instanceof Error ? e.message : e);
     return null;
   });
 
   // After expanding everything, capture the final Search Eligibility screen (full page).
   try {
-    const p = searchEligibilityScreenshotPath();
+    const sanitizePart = (s: string) =>
+      s
+        .trim()
+        .replace(/[^\w.-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 80);
+
+    // firstNameMi comes from the recipient information already extracted above (reliable).
+    // medicaidBillingNumber comes directly from cfg (the value we searched with).
+    const firstNameMi = String(eligibilityPayload?.recipientInformation?.firstNameMi || "").trim();
+    const mbn = String(cfg.medicaidBillingNumber || "").trim();
+
+    console.log("[OHID] Screenshot name — firstNameMi:", JSON.stringify(firstNameMi), "| mbn:", JSON.stringify(mbn));
+
+    const baseDir = dirname(searchEligibilityScreenshotPath());
+    let fileName: string;
+    if (firstNameMi && mbn) {
+      fileName = `${sanitizePart(firstNameMi)}_${sanitizePart(mbn)}.png`;
+    } else if (firstNameMi) {
+      fileName = `${sanitizePart(firstNameMi)}_${nowStamp()}.png`;
+    } else if (mbn) {
+      fileName = `${sanitizePart(mbn)}_${nowStamp()}.png`;
+    } else {
+      fileName = `search-eligibility-${ohidRunIdFromEnv()}-${nowStamp()}.png`;
+    }
+    console.log("[OHID] Screenshot will be saved as:", fileName);
+
+    const p = join(baseDir, fileName);
     await mkdir(dirname(p), { recursive: true });
     await formPage.screenshot({ path: p, fullPage: true }).catch(() => undefined);
     console.log("[OHID] Saved Search Eligibility screenshot:", p);
-
-    // Also capture a "tabs overview" (titles + URLs + thumbnails) to show what was open at this moment.
-    const tabsShot = await captureTabsOverviewScreenshot(formPage.context());
-    if (tabsShot) {
-      console.log("[OHID] Saved tabs overview screenshot:", tabsShot);
-    }
   } catch (e) {
     console.warn(
       "[OHID] Could not write Search Eligibility screenshot (continuing):",

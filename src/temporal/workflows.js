@@ -119,7 +119,15 @@ export async function availityLoginWorkflow(_input) {
  *     companyName?: string;
  *   };
  * } | Record<string, never>} input
- * @returns {Promise<{ ok: true, attempts: 1, searchEligibility?: object | null, eligibilityCompanyMatch?: object | null }>}
+ * @returns {Promise<{
+ *   ok: true;
+ *   attempts: 1;
+ *   searchEligibility: object | null;
+ *   eligibilityCompanyMatch: object | null;
+ *   billingAuth: { ok: true; token: string } | { ok: false; error: string; status?: number } | { skipped: true; reason: string };
+ *   billingJwtToken: string | null;
+ *   lookupData?: { taskCategories: object; priorities: object } | null;
+ * }>}
  */
 export async function ohidLoginWorkflow(input) {
   const runId = typeof input?.runId === "string" ? input.runId : workflowInfo().workflowId;
@@ -141,7 +149,6 @@ export async function ohidLoginWorkflow(input) {
         }
       : undefined;
 
-  // ✅ NEW CHANGE: Workflow input snapshot (Temporal UI → Workflow history)
   log.info("Workflow started", {
     runId,
     hasMedicateSearch: !!medicateSearch,
@@ -151,7 +158,21 @@ export async function ohidLoginWorkflow(input) {
   const __ohidActivityResult = await runOhidLogin({ runId, medicateSearch });
   log.info("ohidLoginWorkflow: runOhidLogin completed");
 
+  const __billingAuth =
+    __ohidActivityResult?.billingAuth != null
+      ? __ohidActivityResult.billingAuth
+      : { skipped: true, reason: "billingAuth missing from activity — restart worker" };
+
+  if (typeof __billingAuth === "object" && "ok" in __billingAuth && __billingAuth.ok) {
+    log.info("Workflow result (BillingAuth JWT)", { ok: true, tokenLength: __billingAuth.token?.length ?? 0 });
+  } else if (typeof __billingAuth === "object" && "skipped" in __billingAuth && __billingAuth.skipped) {
+    log.info("Workflow result (BillingAuth JWT)", { skipped: true, reason: __billingAuth.reason });
+  } else if (typeof __billingAuth === "object" && "ok" in __billingAuth && !__billingAuth.ok) {
+    log.info("Workflow result (BillingAuth JWT)", { ok: false, error: __billingAuth.error });
+  }
+
   const __se = __ohidActivityResult?.searchEligibility ?? null;
+  const __recipient = __ohidActivityResult?.recipientInformation ?? null;
   const __em =
     __ohidActivityResult?.eligibilityCompanyMatch ??
     (__se && typeof __se === "object" ? __se.companyMatch : null) ??
@@ -161,7 +182,6 @@ export async function ohidLoginWorkflow(input) {
     log.info("Workflow result (Search Eligibility JSON)", {
       benefitAssignmentPlans: __se.benefitAssignmentPlans?.length ?? 0,
       managedCarePlans: __se.managedCarePlans?.length ?? 0,
-      extractionWarnings: __se.extractionWarnings ?? null,
     });
   }
   if (__em != null && typeof __em === "object") {
@@ -174,10 +194,42 @@ export async function ohidLoginWorkflow(input) {
     });
   }
 
+  const billingJwtToken =
+    __billingAuth != null &&
+    typeof __billingAuth === "object" &&
+    "ok" in __billingAuth &&
+    __billingAuth.ok &&
+    "token" in __billingAuth &&
+    typeof __billingAuth.token === "string"
+      ? __billingAuth.token
+      : null;
+
+  const __lookup =
+    __ohidActivityResult != null &&
+    typeof __ohidActivityResult === "object" &&
+    "lookupData" in __ohidActivityResult
+      ? /** @type {{ lookupData?: unknown }} */ (__ohidActivityResult).lookupData
+      : null;
+
+  const __nonEncounterTaskAdd =
+    __ohidActivityResult != null &&
+    typeof __ohidActivityResult === "object" &&
+    "nonEncounterTaskAdd" in __ohidActivityResult
+      ? /** @type {{ nonEncounterTaskAdd?: unknown }} */ (__ohidActivityResult).nonEncounterTaskAdd
+      : null;
+
   return {
     ok: true,
     attempts: 1,
     searchEligibility: __se ?? null,
+    recipientInformation: __recipient,
     eligibilityCompanyMatch: __em ?? null,
+    billingAuth: __billingAuth,
+    billingJwtToken,
+    lookupData: __lookup != null && typeof __lookup === "object" ? __lookup : null,
+    nonEncounterTaskAdd:
+      __nonEncounterTaskAdd != null && typeof __nonEncounterTaskAdd === "object"
+        ? __nonEncounterTaskAdd
+        : null,
   };
 }

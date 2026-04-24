@@ -20,6 +20,7 @@ import {
   storeOtpForWorkflow,
 } from "./otpStore.js";
 import { twilioWebhookRouter } from "./twilioController.js";
+import { enrichOhidWorkflowResultWithBilling } from "./ohid-workflow-result-enrich.js";
 
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -684,14 +685,22 @@ app.post("/medicate-availability-check-await-result", awaitResultLimiter, async 
 
     const workflowRunTimeout = "50m";
 
-    const workflowResult = await client.workflow.execute(OHID_LOGIN_WORKFLOW, {
+    const rawWorkflowResult = await client.workflow.execute(OHID_LOGIN_WORKFLOW, {
       taskQueue: TASK_QUEUE,
       workflowId,
       args: [workflowArgs],
       workflowRunTimeout,
     });
 
-    // ✅ NEW CHANGE: Same object as Temporal “Result” + alias `response` for clients
+    /** @type {Record<string, unknown>} */
+    const workflowResult = await enrichOhidWorkflowResultWithBilling(
+      rawWorkflowResult && typeof rawWorkflowResult === "object"
+        ? /** @type {Record<string, unknown>} */ (rawWorkflowResult)
+        : {},
+    );
+
+    // Same keys as Temporal workflow result when worker is current; if worker omitted billingAuth,
+    // API process fills it here so Postman/clients still receive JWT + flat helpers.
     res.status(200).json({
       ok: true,
       workflowId,

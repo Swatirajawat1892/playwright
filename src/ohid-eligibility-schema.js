@@ -23,7 +23,21 @@ const EligibilityCompanyMatchResultSchema = z.object({
   message: z.string(),
 });
 
+const RecipientInformationSchema = z.object({
+  medicaidBillingNumber: z.string().nullable(),
+  lastName: z.string().nullable(),
+  firstNameMi: z.string().nullable(),
+  dateOfBirth: z.string().nullable(),
+  dateOfDeath: z.string().nullable(),
+  ssn: z.string().nullable(),
+  gender: z.string().nullable(),
+  countyOfResidence: z.string().nullable(),
+  countyOfEligibility: z.string().nullable(),
+  countyOfficeInformationUrl: z.string().nullable(),
+});
+
 export const OhidEligibilityStdoutPayloadSchema = z.object({
+  recipientInformation: RecipientInformationSchema.optional(),
   benefitAssignmentPlans: z.array(BenefitAssignmentPlanRowSchema),
   managedCarePlans: z.array(ManagedCarePlanRowSchema),
   companyMatch: EligibilityCompanyMatchResultSchema.nullable(),

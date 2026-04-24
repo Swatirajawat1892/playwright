@@ -2,7 +2,7 @@
  * Search Eligibility results (SearchEligibility.aspx): scrape BENEFIT/ASSIGNMENT PLAN(S) and
  * MANAGED CARE PLANS tables, optional companyName match, and emit a parseable stdout line for Temporal.
  */
-import type { Page } from "playwright";
+import type { Page, Locator } from "playwright";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,8 +37,22 @@ export type ManagedCarePlanRow = {
   managedCareBenefits: string;
 };
 
+export type RecipientInformation = {
+  medicaidBillingNumber: string | null;
+  lastName: string | null;
+  firstNameMi: string | null;
+  dateOfBirth: string | null;
+  dateOfDeath: string | null;
+  ssn: string | null;
+  gender: string | null;
+  countyOfResidence: string | null;
+  countyOfEligibility: string | null;
+  countyOfficeInformationUrl: string | null;
+};
+
 /** Emitted on stdout between prefix/suffix; parsed by `src/temporal/activities.js`. */
 export type OhidEligibilityStdoutPayload = {
+  recipientInformation?: RecipientInformation;
   benefitAssignmentPlans: BenefitAssignmentPlanRow[];
   managedCarePlans: ManagedCarePlanRow[];
   /** Present when `companyName` was provided in medicate search. */
@@ -46,6 +60,109 @@ export type OhidEligibilityStdoutPayload = {
   /** Non-fatal scrape issues (empty sections still return `[]`). */
   extractionWarnings?: string[];
 };
+
+function normalizeMaybeText(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+async function readValueByLabel(scope: Page | Locator, labelRe: RegExp): Promise<string | null> {
+  try {
+    const byLabel = scope.getByLabel(labelRe).first();
+
+    if ((await byLabel.count().catch(() => 0)) > 0) {
+      const value = await byLabel
+        .evaluate((el: Element) => {
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            return el.value ?? "";
+          }
+          if (el instanceof HTMLSelectElement) {
+            const selected = el.selectedOptions?.[0];
+            return selected?.text ?? el.value ?? "";
+          }
+          return "";
+        })
+        .catch(() => "");
+
+      return normalizeMaybeText(value || "") || null;
+    }
+  } catch {
+    // fall through
+  }
+
+  const container = scope
+    .locator("div.form-horizontal")
+    .filter({
+      has: scope.locator("label, span").filter({ hasText: labelRe }).first(),
+    })
+    .first();
+
+  if (!(await container.count().catch(() => 0))) return null;
+
+  const control = container.locator("input, select, textarea").first();
+  if ((await control.count().catch(() => 0)) === 0) return null;
+
+  const value = await control
+    .evaluate((el: Element) => {
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        return el.value ?? "";
+      }
+      if (el instanceof HTMLSelectElement) {
+        const selected = el.selectedOptions?.[0];
+        return selected?.text ?? el.value ?? "";
+      }
+      return "";
+    })
+    .catch(() => "");
+
+  return normalizeMaybeText(value || "") || null;
+}
+
+async function extractRecipientInformation(formPage: Page): Promise<{
+  info: RecipientInformation;
+  warning?: string;
+}> {
+  const section = formPage.locator(".resultContainer2.active");
+  await section.waitFor({ state: "visible" });
+
+  await formPage
+    .waitForFunction(() => {
+      const mbn = document.querySelector("#txtMBNDisp") as HTMLInputElement | null;
+      const dob = document.querySelector("#txtDOBDisp") as HTMLInputElement | null;
+      return !!mbn?.value?.trim() || !!dob?.value?.trim();
+    }, { timeout: 5000 })
+    .catch(() => {});
+
+  const info: RecipientInformation = {
+    medicaidBillingNumber: await readValueByLabel(section, /^Medicaid\s*Billing\s*Number:?$/i),
+    lastName: await readValueByLabel(section, /^Last\s*Name:?$/i),
+    firstNameMi: await readValueByLabel(section, /^First\s*Name,\s*MI:?$/i),
+    dateOfBirth: await readValueByLabel(section, /^Date\s*of\s*Birth:?$/i),
+    dateOfDeath: await readValueByLabel(section, /^Date\s*Of\s*Death:?$/i),
+    ssn: await readValueByLabel(section, /^SSN:?$/i),
+    gender: await readValueByLabel(section, /^Gender:?$/i),
+    countyOfResidence: await readValueByLabel(section, /^County\s*of\s*Residence:?$/i),
+    countyOfEligibility: await readValueByLabel(section, /^County\s*of\s*Eligibility:?$/i),
+    countyOfficeInformationUrl: null,
+  };
+
+  const link = section
+    .locator('a[href*="local-agencies-directory"], a#txtCOIDisp')
+    .first();
+
+  if (await link.isVisible().catch(() => false)) {
+    const href = (await link.getAttribute("href").catch(() => null)) ?? null;
+    info.countyOfficeInformationUrl = href ? normalizeMaybeText(href) : null;
+  }
+
+  const hasAny =
+    Object.values(info).filter((v) => typeof v === "string" && v.trim() !== "").length > 0;
+
+  if (!hasAny) {
+    return { info, warning: "RECIPIENT INFORMATION section not detected (no fields scraped)" };
+  }
+
+  return { info };
+}
 
 async function ensureBenefitAssignmentSectionExpanded(formPage: Page): Promise<void> {
   const marker = formPage
@@ -290,6 +407,9 @@ export async function reportSearchEligibilityPageData(
     await formPage.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => undefined);
     await new Promise<void>((r) => setTimeout(r, 400));
 
+    const recipient = await extractRecipientInformation(formPage);
+    if (recipient.warning) warnings.push(recipient.warning);
+
     const benefit = await extractBenefitAssignmentPlans(formPage);
     if (benefit.warning) warnings.push(benefit.warning);
 
@@ -299,6 +419,7 @@ export async function reportSearchEligibilityPageData(
     const companyMatch = computeCompanyMatch(cfg, managed.rows);
 
     const payload: OhidEligibilityStdoutPayload = {
+      recipientInformation: recipient.info,
       benefitAssignmentPlans: benefit.rows,
       managedCarePlans: managed.rows,
       companyMatch,
