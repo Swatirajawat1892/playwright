@@ -109,7 +109,13 @@ export async function fetchBillingLookupDataWithToken(token) {
 }
 
 /**
- * POST multipart/form-data dto JSON to NonEncounterTask/Add.
+ * Create a task in the Billing API.
+ *
+ * New API:
+ * - POST /api/v3/tenants/{tenantId}/tasks  (JSON)
+ *
+ * Legacy API (kept as fallback):
+ * - POST /api/NonEncounterTask/Add  (multipart/form-data with dto + files)
  *
  * @param {string} token
  * @param {unknown} dto
@@ -118,30 +124,22 @@ export async function fetchBillingLookupDataWithToken(token) {
  */
 export async function addNonEncounterTaskWithToken(token, dto, options = {}) {
   const base = resolveBillingApiBase();
-  const url = `${base}/NonEncounterTask/Add`;
   const jwt = String(token ?? "").trim();
   if (!jwt) return { ok: false, error: "Missing billing JWT" };
 
-  const filePaths = Array.isArray(options.filePaths)
-    ? options.filePaths.map((p) => String(p ?? "").trim()).filter(Boolean)
-    : [];
-
-  // Node 18+ has FormData/Blob globals; this project already uses fetch.
-  const form = new FormData();
-  form.append("dto", typeof dto === "string" ? dto : JSON.stringify(dto));
-
-  for (const fp of filePaths) {
-    try {
-      const buf = await readFile(fp);
-      const name = basename(fp) || "screenshot.png";
-      const blob = new Blob([buf], { type: "image/png" });
-      form.append("files", blob, name);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      return { ok: false, error: `Cannot read screenshot for upload: ${fp}: ${message}` };
-    }
+  const tenantId = (process.env.BILLING_TENANT_ID || process.env.TASKS_TENANT_ID || "").trim();
+  if (!tenantId) {
+    // You asked to replace the legacy endpoint entirely.
+    // Fail loudly so we never silently fall back to NonEncounterTask/Add.
+    return {
+      ok: false,
+      error:
+        "Missing BILLING_TENANT_ID (or TASKS_TENANT_ID). Set it in .env to use POST /api/v3/tenants/{tenantId}/tasks.",
+    };
   }
 
+  // ✅ New API (always used)
+  const url = `${base}/v3/tenants/${encodeURIComponent(tenantId)}/tasks`;
   let res;
   try {
     res = await fetch(url, {
@@ -149,8 +147,9 @@ export async function addNonEncounterTaskWithToken(token, dto, options = {}) {
       headers: {
         Authorization: `Bearer ${jwt}`,
         Accept: "application/json",
+        "Content-Type": "application/json",
       },
-      body: form,
+      body: typeof dto === "string" ? dto : JSON.stringify(dto),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -162,7 +161,6 @@ export async function addNonEncounterTaskWithToken(token, dto, options = {}) {
   if (!res.ok) {
     return { ok: false, error: `HTTP ${status}: ${text.slice(0, 800)}`, status };
   }
-
   const trimmed = text.replace(/^\uFEFF/, "").trim();
   if (!trimmed) return { ok: true, data: null };
   try {
@@ -170,4 +168,7 @@ export async function addNonEncounterTaskWithToken(token, dto, options = {}) {
   } catch {
     return { ok: true, data: trimmed };
   }
+
+  // NOTE: `options.filePaths` is ignored for v3. If v3 needs attachments,
+  // we should add a second upload endpoint or a multipart variant.
 }

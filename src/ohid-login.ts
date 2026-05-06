@@ -76,6 +76,37 @@ function tabsOverviewScreenshotPath(): string {
   return join(dir, `tabs-overview-${ohidRunIdFromEnv()}-${nowStamp()}.png`);
 }
 
+function ohidRunStatePath(): string {
+  const base = (process.env.OHID_RUN_STATE_DIR ?? "").trim() || join(PROJECT_ROOT, "data", "ohid-run-state");
+  const dir = isAbsolute(base) ? base : join(PROJECT_ROOT, base);
+  return join(dir, `${ohidRunIdFromEnv()}.json`);
+}
+
+async function writeOhidRunState(partial: Record<string, unknown>): Promise<void> {
+  const p = ohidRunStatePath();
+  await mkdir(dirname(p), { recursive: true });
+  let existing: Record<string, unknown> = {};
+  try {
+    if (existsSync(p)) {
+      existing = JSON.parse(await readFile(p, "utf8")) as Record<string, unknown>;
+    }
+  } catch {
+    existing = {};
+  }
+  const merged = { ...existing, ...partial, updatedAt: new Date().toISOString() };
+  await writeFile(p, JSON.stringify(merged, null, 2), "utf8");
+}
+
+async function readOhidRunState(): Promise<Record<string, unknown> | null> {
+  const p = ohidRunStatePath();
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(await readFile(p, "utf8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 async function captureTabsOverviewScreenshot(context: BrowserContext): Promise<string | null> {
   try {
     const pages = context.pages().filter((p) => !p.isClosed());
@@ -557,6 +588,14 @@ async function waitPastLoginPage(page: Page, timeoutMs: number): Promise<void> {
 
 function shouldOpenProviderNetworkAfterLogin(): boolean {
   return process.env.OHID_OPEN_PNM !== "false";
+}
+
+type OhidStep = "login" | "pnm" | "eligibility" | "full";
+
+function ohidStepFromEnv(): OhidStep {
+  const v = (process.env.OHID_STEP ?? "").trim().toLowerCase();
+  if (v === "login" || v === "pnm" || v === "eligibility" || v === "full") return v;
+  return "full";
 }
 
 /**
@@ -1817,6 +1856,14 @@ async function persistOhidSession(context: BrowserContext, pageForLog: Page): Pr
   await writeFile(finalPath, JSON.stringify(cleaned, null, 2), "utf8");
   console.log("OHID flow completed. Session saved (ATC / atcemr cookies stripped):", finalPath);
   try {
+    await writeOhidRunState({
+      lastUrl: pageForLog.url(),
+      lastSavedSessionPath: finalPath,
+    });
+  } catch {
+    // Non-fatal: state file is only for step-based resume.
+  }
+  try {
     console.log("Current URL:", pageForLog.url());
   } catch {
     /* page may be detached */
@@ -1914,7 +1961,24 @@ async function main(): Promise<void> {
   }
 
   try {
-    await page.goto(OHID_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: OH.goto });
+    const step = ohidStepFromEnv();
+
+    // For step-based runs (Temporal multi-activity), do NOT restart from the login page after the first step.
+    // We rely on the saved storageState, plus a small run-state file that remembers the last URL.
+    if (step === "login" || step === "full") {
+      await page.goto(OHID_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: OH.goto });
+    } else {
+      // pnm / eligibility: prefer resuming from lastUrl (usually SearchEligibility.aspx after the PNM step).
+      const state = await readOhidRunState();
+      const lastUrl = state && typeof state.lastUrl === "string" ? state.lastUrl : "";
+      const resumeUrl = step === "eligibility" && lastUrl ? lastUrl : OHID_MY_APPS_URL;
+      await page.goto(resumeUrl, { waitUntil: "domcontentloaded", timeout: OH.goto });
+      if (/auth\.ohid\.ohio\.gov\/login/i.test(page.url())) {
+        throw new Error(
+          `[OHID] Session not logged in (redirected to /login). Run the login step first (OHID_STEP=login), then continue.`,
+        );
+      }
+    }
 
     if (cdpUrl) {
       await closeNoiseTabsExcept(browser, page);
@@ -1924,6 +1988,11 @@ async function main(): Promise<void> {
     if (!landedOnLogin) {
       console.log("[Session] Saved session valid — already past login. URL:", page.url());
     } else {
+      if (step !== "login" && step !== "full") {
+        throw new Error(
+          `[OHID] OHID_STEP=${step} requires an existing logged-in session, but we are on /login. Run OHID_STEP=login first.`,
+        );
+      }
       try {
         await fillAndSubmit(page);
       } catch (err) {
@@ -1946,9 +2015,32 @@ async function main(): Promise<void> {
 
       await page.waitForLoadState("networkidle", { timeout: OH.networkIdle }).catch(() => undefined);
     }
+    if (step === "login") {
+      console.log("[OHID] OHID_STEP=login — saving session and exiting after login.");
+      await persistOhidSession(context, page);
+      return;
+    }
 
     if (shouldOpenProviderNetworkAfterLogin()) {
-      await openProviderNetworkAndAcceptTerms(page, context);
+      if (step === "eligibility") {
+        // Eligibility step should resume from lastUrl (preferably SearchEligibility.aspx) and not redo PNM.
+        // If we're not already in the PNM app, fall back to the normal navigation.
+        if (/SearchEligibility\.aspx/i.test(page.url())) {
+          console.log("[OHID] OHID_STEP=eligibility — already on SearchEligibility.aspx (resume).");
+          await fillSearchEligibilityIfConfigured(page);
+        } else {
+          console.log("[OHID] OHID_STEP=eligibility — not on SearchEligibility.aspx; falling back to PNM navigation.");
+          await openProviderNetworkAndAcceptTerms(page, context);
+        }
+      } else {
+        await openProviderNetworkAndAcceptTerms(page, context);
+      }
+    }
+
+    if (step === "pnm") {
+      console.log("[OHID] OHID_STEP=pnm — saving session and exiting after opening PNM / terms.");
+      await persistOhidSession(context, page);
+      return;
     }
 
     if (shouldStopAfterSearchEligibility()) {

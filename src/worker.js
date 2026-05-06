@@ -4,7 +4,41 @@
 import { Worker, NativeConnection } from "@temporalio/worker";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import * as activities from "./temporal/activities.js";
+import * as availityActivities from "./temporal/activities-availity.js";
+import * as ohidActivities from "./temporal/activities-ohid-run.js";
+import { AVAILITY_ACTIVITY_TYPE, OHID_ACTIVITY_TYPE } from "./temporal/activity-type-names.js";
+
+const activities = {
+  // Friendly activity type names (UI)
+  [AVAILITY_ACTIVITY_TYPE.PERFORM_LOGIN]: availityActivities.performLoginAttempt,
+  [AVAILITY_ACTIVITY_TYPE.POLL_OTP]: availityActivities.pollOtpFromStore,
+  [AVAILITY_ACTIVITY_TYPE.SUBMIT_OTP]: availityActivities.submitOtpAndConfirm,
+
+  [OHID_ACTIVITY_TYPE.SIGN_IN]: ohidActivities.ohidPlaywrightLogin,
+  [OHID_ACTIVITY_TYPE.ELIGIBILITY]: ohidActivities.ohidPlaywrightEligibility,
+  [OHID_ACTIVITY_TYPE.PARSE_ELIGIBILITY]: ohidActivities.ohidParseEligibility,
+  [OHID_ACTIVITY_TYPE.FETCH_BILLING_AUTH]: ohidActivities.ohidFetchBillingAuth,
+  [OHID_ACTIVITY_TYPE.FETCH_LOOKUP_DATA]: ohidActivities.ohidFetchLookupData,
+  [OHID_ACTIVITY_TYPE.ADD_NON_ENCOUNTER_TASK]: ohidActivities.ohidAddNonEncounterTask,
+  [OHID_ACTIVITY_TYPE.OPEN_PNM]: ohidActivities.ohidPlaywrightOpenPnm,
+  [OHID_ACTIVITY_TYPE.RUN_PLAYWRIGHT]: ohidActivities.ohidRunPlaywright,
+  [OHID_ACTIVITY_TYPE.RUN_OHID_LOGIN]: ohidActivities.runOhidLogin,
+
+  // Legacy activity type names (backward compatibility)
+  performLoginAttempt: availityActivities.performLoginAttempt,
+  pollOtpFromStore: availityActivities.pollOtpFromStore,
+  submitOtpAndConfirm: availityActivities.submitOtpAndConfirm,
+
+  ohidPlaywrightLogin: ohidActivities.ohidPlaywrightLogin,
+  ohidPlaywrightEligibility: ohidActivities.ohidPlaywrightEligibility,
+  ohidParseEligibility: ohidActivities.ohidParseEligibility,
+  ohidFetchBillingAuth: ohidActivities.ohidFetchBillingAuth,
+  ohidFetchLookupData: ohidActivities.ohidFetchLookupData,
+  ohidAddNonEncounterTask: ohidActivities.ohidAddNonEncounterTask,
+  ohidPlaywrightOpenPnm: ohidActivities.ohidPlaywrightOpenPnm,
+  ohidRunPlaywright: ohidActivities.ohidRunPlaywright,
+  runOhidLogin: ohidActivities.runOhidLogin,
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -17,6 +51,7 @@ const TEMPORAL_NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default";
  * @param {{ nativeConnection?: import('@temporalio/worker').NativeConnection }} [options]
  */
 export async function runWorker(options = {}) {
+  console.log("[Temporal] Registered activities:", Object.keys(activities));
   let connection;
   if (options.nativeConnection) {
     connection = options.nativeConnection;

@@ -39,16 +39,30 @@ async function tryReadEligibilityArtifact(runId) {
 }
 
 function resolveNpmCliPath() {
+  // 1. Prefer npm_execpath if set by a parent npm process
   const fromEnv = process.env.npm_execpath?.trim();
   if (fromEnv && existsSync(fromEnv)) {
     return fromEnv;
   }
+  // 2. Try resolving the npm package from node_modules (works in some setups)
   const req = createRequire(import.meta.url);
   try {
     return req.resolve("npm/bin/npm-cli.js");
   } catch {
-    return null;
+    // not in local node_modules — continue
   }
+  // 3. Look for npm bundled alongside the current Node.js executable
+  //    e.g. C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js
+  const nodeDir = dirname(process.execPath);
+  const candidates = [
+    join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+    join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    join(nodeDir, "..", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
 }
 
 async function runNpmScript(scriptName, envOverrides = undefined) {
@@ -76,11 +90,14 @@ async function runNpmScript(scriptName, envOverrides = undefined) {
 
     let child;
     try {
+      // shell:true is required on Windows so that .cmd files (npm.cmd) are executed
+      // correctly via cmd.exe rather than being spawned directly (which fails with ENOENT).
       child = spawn(npmCmd, ["run", scriptName], {
         cwd: PROJECT_ROOT,
         env,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: false,
+        shell: process.platform === "win32",
       });
     } catch (e) {
       try {
@@ -244,21 +261,10 @@ async function resolveSearchEligibilityScreenshotPath(stdout, runId) {
 }
 
 /**
- * Runs the OHID Playwright login flow as a Temporal activity.
- * This executes `npm run login:ohid` in the worker process environment.
- *
- * @param {{
- *   runId?: string;
- *   medicateSearch?: {
- *     medicaidBillingNumber: string;
- *     dateOfBirth: string;
- *     fromDos: string;
- *     toDos: string;
- *     companyName?: string;
- *   };
- * }} input
+ * Step 1: run Playwright (`npm run login:ohid`).
+ * Returns the stdout tail so later activities can parse markers.
  */
-export async function runOhidLogin(input) {
+export async function ohidRunPlaywright(input) {
   const runId = input?.runId ? String(input.runId) : "";
   /** @type {{ path: string, fd: import("node:fs/promises").FileHandle } | null} */
   let runLock = null;
@@ -268,15 +274,13 @@ export async function runOhidLogin(input) {
     runId,
     startedAt: new Date().toISOString(),
     status: "running",
+    step: "playwright",
   };
   try {
-    log.info("Starting OHID Playwright (npm run login:ohid)");
-    console.log("[OHID][activity] Starting OHID Playwright (npm run login:ohid)");
+    log.info("OHID step: Playwright run (npm run login:ohid)");
     /** @type {Record<string, string>} */
     const envOverrides = {};
-    if (runId) {
-      envOverrides.OHID_WORKFLOW_RUN_ID = runId;
-    }
+    if (runId) envOverrides.OHID_WORKFLOW_RUN_ID = runId;
     if (
       input?.medicateSearch &&
       typeof input.medicateSearch.medicaidBillingNumber === "string" &&
@@ -285,21 +289,20 @@ export async function runOhidLogin(input) {
       typeof input.medicateSearch.toDos === "string"
     ) {
       envOverrides.OHID_MEDICATE_SEARCH_JSON = JSON.stringify(input.medicateSearch);
-      console.log("[OHID][activity] medicateSearch payload present (OHID_MEDICATE_SEARCH_JSON).");
-      // Exit soon after Search Eligibility scrape (no ATC automation). Hold timing is OHID_MEDICATE_HOLD_AFTER_SEARCH_MS in ohid-login.
       envOverrides.OHID_STAY_MS = envOverrides.OHID_STAY_MS ?? "0";
       envOverrides.DASHBOARD_STAY_MS = envOverrides.DASHBOARD_STAY_MS ?? "0";
     }
+
     const res = await runNpmScript("login:ohid", Object.keys(envOverrides).length ? envOverrides : undefined);
     if (res.exitCode !== 0) {
       const msg = `OHID Playwright failed (exitCode=${res.exitCode}, signal=${res.signal ?? ""}).`;
-      console.error("[OHID][activity]", msg);
       globalThis.__OHID_LAST_ACTIVITY__ = {
         kind: "ohid",
         runId,
         startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
         finishedAt: new Date().toISOString(),
         status: "failed",
+        step: "playwright",
         exitCode: res.exitCode,
         signal: res.signal,
         stderrTail: res.stderrTail,
@@ -308,9 +311,163 @@ export async function runOhidLogin(input) {
       throw new Error(`${msg}\n\nstderr:\n${res.stderrTail}\n\nstdout:\n${res.stdoutTail}`);
     }
 
-    // Prefer artifact file (less brittle than parsing logs), fallback to stdout marker.
+    globalThis.__OHID_LAST_ACTIVITY__ = {
+      kind: "ohid",
+      runId,
+      startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
+      finishedAt: new Date().toISOString(),
+      status: "succeeded",
+      step: "playwright",
+      pid: res.pid,
+      elapsedMs: res.elapsedMs,
+    };
+
+    return { ok: true, runId, pid: res.pid, elapsedMs: res.elapsedMs, stdoutTail: res.stdoutTail };
+  } finally {
+    await releaseOhidRunLock(runLock);
+  }
+}
+
+async function runOhidPlaywrightScriptStep(scriptInput, envOverrides) {
+  const runId = scriptInput?.runId ? String(scriptInput.runId) : "";
+  /** @type {{ path: string, fd: import("node:fs/promises").FileHandle } | null} */
+  let runLock = null;
+  runLock = await acquireOhidRunLock(runId);
+  try {
+    const res = await runNpmScript("login:ohid", envOverrides);
+    if (res.exitCode !== 0) {
+      const msg = `OHID Playwright failed (exitCode=${res.exitCode}, signal=${res.signal ?? ""}).`;
+      throw new Error(`${msg}\n\nstderr:\n${res.stderrTail}\n\nstdout:\n${res.stdoutTail}`);
+    }
+    return { ok: true, runId, pid: res.pid, elapsedMs: res.elapsedMs, stdoutTail: res.stdoutTail };
+  } finally {
+    await releaseOhidRunLock(runLock);
+  }
+}
+
+export async function ohidPlaywrightLogin(input) {
+  const runId = input?.runId ? String(input.runId) : "";
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: new Date().toISOString(),
+    status: "running",
+    step: "playwright:login",
+  };
+  const envOverrides = {
+    ...(runId ? { OHID_WORKFLOW_RUN_ID: runId } : {}),
+    OHID_STEP: "login",
+    OHID_OPEN_PNM: "false",
+    // ensure a short exit (no "stay" tail)
+    OHID_STAY_MS: "0",
+    DASHBOARD_STAY_MS: "0",
+  };
+  const out = await runOhidPlaywrightScriptStep(input, envOverrides);
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
+    finishedAt: new Date().toISOString(),
+    status: "succeeded",
+    step: "playwright:login",
+    pid: out.pid,
+    elapsedMs: out.elapsedMs,
+  };
+  return out;
+}
+
+export async function ohidPlaywrightOpenPnm(input) {
+  const runId = input?.runId ? String(input.runId) : "";
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: new Date().toISOString(),
+    status: "running",
+    step: "playwright:pnm",
+  };
+  const envOverrides = {
+    ...(runId ? { OHID_WORKFLOW_RUN_ID: runId } : {}),
+    OHID_STEP: "pnm",
+    OHID_OPEN_PNM: "true",
+    // Ensure eligibility fill is skipped in this step
+    OHID_MEDICATE_SEARCH_JSON: "",
+    OHID_STAY_MS: "0",
+    DASHBOARD_STAY_MS: "0",
+  };
+  const out = await runOhidPlaywrightScriptStep(input, envOverrides);
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
+    finishedAt: new Date().toISOString(),
+    status: "succeeded",
+    step: "playwright:pnm",
+    pid: out.pid,
+    elapsedMs: out.elapsedMs,
+  };
+  return out;
+}
+
+export async function ohidPlaywrightEligibility(input) {
+  const runId = input?.runId ? String(input.runId) : "";
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: new Date().toISOString(),
+    status: "running",
+    step: "playwright:eligibility",
+  };
+  /** @type {Record<string, string>} */
+  const envOverrides = {
+    ...(runId ? { OHID_WORKFLOW_RUN_ID: runId } : {}),
+    OHID_STEP: "eligibility",
+    OHID_OPEN_PNM: "true",
+    OHID_STAY_MS: "0",
+    DASHBOARD_STAY_MS: "0",
+  };
+  if (
+    input?.medicateSearch &&
+    typeof input.medicateSearch.medicaidBillingNumber === "string" &&
+    typeof input.medicateSearch.dateOfBirth === "string" &&
+    typeof input.medicateSearch.fromDos === "string" &&
+    typeof input.medicateSearch.toDos === "string"
+  ) {
+    envOverrides.OHID_MEDICATE_SEARCH_JSON = JSON.stringify(input.medicateSearch);
+  }
+  const out = await runOhidPlaywrightScriptStep(input, envOverrides);
+  globalThis.__OHID_LAST_ACTIVITY__ = {
+    kind: "ohid",
+    runId,
+    startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
+    finishedAt: new Date().toISOString(),
+    status: "succeeded",
+    step: "playwright:eligibility",
+    pid: out.pid,
+    elapsedMs: out.elapsedMs,
+  };
+  return out;
+}
+
+/**
+ * Step 2: parse eligibility + company match + recipient info.
+ */
+export async function ohidParseEligibility(input) {
+  const runId = input?.runId ? String(input.runId) : "";
+  const stdoutTail = typeof input?.stdoutTail === "string" ? input.stdoutTail : "";
+  /** @type {{ path: string, fd: import("node:fs/promises").FileHandle } | null} */
+  let runLock = null;
+  runLock = await acquireOhidRunLock(runId);
+  try {
+    globalThis.__OHID_LAST_ACTIVITY__ = {
+      kind: "ohid",
+      runId,
+      startedAt: new Date().toISOString(),
+      status: "running",
+      step: "parseEligibility",
+    };
+
     const artifact = await tryReadEligibilityArtifact(runId);
-    const parsed = artifact ?? parseOhidEligibilityResultFromStdout(res.stdoutTail);
+    const parsed = artifact ?? parseOhidEligibilityResultFromStdout(stdoutTail);
     /** @type {object | null} */
     let searchEligibility = null;
     /** @type {object | null} */
@@ -323,178 +480,13 @@ export async function runOhidLogin(input) {
         searchEligibility = parsed;
         eligibilityCompanyMatch = parsed.companyMatch ?? null;
         recipientInformation = parsed.recipientInformation ?? null;
-        log.info("Playwright Search Eligibility JSON", {
-          benefitRows: parsed.benefitAssignmentPlans?.length ?? 0,
-          managedCareRows: parsed.managedCarePlans?.length ?? 0,
-          hasCompanyMatch: parsed.companyMatch != null,
-        });
-        console.log("[OHID][activity] searchEligibility (tables + optional companyMatch) parsed from stdout.");
-        if (eligibilityCompanyMatch != null) {
-          log.info("Playwright eligibility company match", {
-            match: eligibilityCompanyMatch.match,
-            inputCompanyName: eligibilityCompanyMatch.inputCompanyName,
-            uiCompanyName: eligibilityCompanyMatch.uiCompanyName,
-          });
-        }
       } else if (typeof parsed.match === "boolean" && "inputCompanyName" in parsed) {
         eligibilityCompanyMatch = parsed;
         searchEligibility = { benefitAssignmentPlans: [], managedCarePlans: [], companyMatch: parsed };
-        log.info("Playwright eligibility company match (legacy stdout shape)", {
-          match: parsed.match,
-          inputCompanyName: parsed.inputCompanyName,
-        });
       }
     }
 
-    const companyNameMatched =
-      eligibilityCompanyMatch != null &&
-      typeof eligibilityCompanyMatch === "object" &&
-      "match" in eligibilityCompanyMatch &&
-      eligibilityCompanyMatch.match === true;
-
-    /** @type {{ ok: true; token: string } | { ok: false; error: string; status?: number } | { skipped: true; reason: string }} */
-    let billingAuth = { skipped: true, reason: "BillingAuth not run yet" };
-    /** @type {{ taskCategories: unknown; priorities: unknown } | null} */
-    let lookupData = null;
-    /** @type {unknown | null} */
-    let nonEncounterTaskAdd = null;
-
-    if (!companyNameMatched) {
-      const reason =
-        eligibilityCompanyMatch == null
-          ? "Company match not evaluated (provide medicateSearch.companyName); BillingAuth / LookupData / NonEncounterTask not called."
-          : "Company name did not match; BillingAuth / LookupData / NonEncounterTask not called.";
-      billingAuth = { skipped: true, reason };
-      nonEncounterTaskAdd = { skipped: true, reason };
-      log.info("Billing chain skipped (company name not matched)", {
-        hasCompanyMatch: eligibilityCompanyMatch != null,
-        match: eligibilityCompanyMatch?.match ?? null,
-      });
-      console.log("[OHID][activity] Billing chain skipped:", reason);
-    } else {
-      try {
-        const auth = await fetchBillingAuthFromEnv();
-        if ("skipped" in auth && auth.skipped) {
-          billingAuth = { skipped: true, reason: auth.reason };
-          log.info("BillingAuth JWT", { skipped: true, reason: auth.reason });
-          console.log("[OHID][activity] BillingAuth skipped:", auth.reason);
-        } else if ("ok" in auth && auth.ok && "token" in auth) {
-          billingAuth = { ok: true, token: auth.token };
-          log.info("BillingAuth JWT", { ok: true, tokenLength: auth.token.length });
-          console.log("[OHID][activity] BillingAuth JWT obtained, length=", auth.token.length);
-        } else if ("ok" in auth && !auth.ok) {
-          billingAuth = {
-            ok: false,
-            error: auth.error,
-            ...(auth.status != null ? { status: auth.status } : {}),
-          };
-          log.warn("BillingAuth JWT failed", { error: auth.error, status: auth.status });
-          console.warn("[OHID][activity] BillingAuth failed:", auth.error);
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        billingAuth = { ok: false, error: msg };
-        log.warn("BillingAuth JWT exception", { message: msg });
-        console.warn("[OHID][activity] BillingAuth exception:", msg);
-      }
-
-      if (
-        billingAuth != null &&
-        typeof billingAuth === "object" &&
-        "ok" in billingAuth &&
-        billingAuth.ok &&
-        "token" in billingAuth &&
-        typeof billingAuth.token === "string" &&
-        billingAuth.token.trim() !== ""
-      ) {
-        try {
-          lookupData = await fetchBillingLookupDataWithToken(billingAuth.token);
-          log.info("Billing LookupData", {
-            taskCategoriesOk: lookupData.taskCategories?.ok === true,
-            prioritiesOk: lookupData.priorities?.ok === true,
-          });
-          console.log(
-            "[OHID][activity] LookupData TaskCategories:",
-            JSON.stringify(lookupData.taskCategories, null, 2),
-          );
-          console.log(
-            "[OHID][activity] LookupData Priorities:",
-            JSON.stringify(lookupData.priorities, null, 2),
-          );
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          lookupData = {
-            taskCategories: { ok: false, error: msg },
-            priorities: { ok: false, error: msg },
-          };
-          log.warn("Billing LookupData exception", { message: msg });
-          console.warn("[OHID][activity] LookupData exception:", msg);
-        }
-      }
-
-      const jwt =
-        billingAuth != null &&
-        typeof billingAuth === "object" &&
-        "ok" in billingAuth &&
-        billingAuth.ok &&
-        "token" in billingAuth &&
-        typeof billingAuth.token === "string"
-          ? billingAuth.token
-          : null;
-      const firstNameMi =
-        recipientInformation != null &&
-        typeof recipientInformation === "object" &&
-        "firstNameMi" in recipientInformation &&
-        typeof recipientInformation.firstNameMi === "string" &&
-        recipientInformation.firstNameMi.trim() !== ""
-          ? recipientInformation.firstNameMi.trim()
-          : null;
-
-      if (jwt && firstNameMi) {
-        try {
-          const dto = {
-            name: firstNameMi,
-            description: "TestTestTestTestTestTestTest",
-            taskCategoryId: 155,
-            priorityId: 3,
-            taskStatusId: 1,
-            assignedToId: null,
-            assignedToRoleId: 1,
-            isAssignedToRole: true,
-            dueDate: "2026-04-22T10:06:13.807Z",
-            taskNotes: [],
-          };
-          const patientIdRaw = (process.env.NON_ENCOUNTER_TASK_PATIENT_ID || "").trim();
-          if (/^\d+$/.test(patientIdRaw)) {
-            dto.patientId = Number(patientIdRaw);
-          }
-          const screenshotPath = await resolveSearchEligibilityScreenshotPath(res.stdoutTail, runId);
-          const filePaths = screenshotPath && existsSync(screenshotPath) ? [screenshotPath] : [];
-          if (screenshotPath && filePaths.length === 0) {
-            console.warn("[OHID][activity] Search Eligibility screenshot path not on disk:", screenshotPath);
-          } else if (filePaths.length) {
-            console.log("[OHID][activity] NonEncounterTask/Add attaching screenshot:", filePaths[0]);
-          } else {
-            console.warn("[OHID][activity] No Search Eligibility screenshot found to upload.");
-          }
-          nonEncounterTaskAdd = await addNonEncounterTaskWithToken(jwt, dto, { filePaths });
-          console.log(
-            "[OHID][activity] NonEncounterTask/Add result:",
-            JSON.stringify(nonEncounterTaskAdd, null, 2),
-          );
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          nonEncounterTaskAdd = { ok: false, error: msg };
-        }
-      } else {
-        nonEncounterTaskAdd = {
-          ok: false,
-          error: !jwt
-            ? "Missing billing JWT"
-            : "Missing recipientInformation.firstNameMi",
-        };
-      }
-    }
+    const screenshotPath = await resolveSearchEligibilityScreenshotPath(stdoutTail, runId);
 
     globalThis.__OHID_LAST_ACTIVITY__ = {
       kind: "ohid",
@@ -502,29 +494,162 @@ export async function runOhidLogin(input) {
       startedAt: globalThis.__OHID_LAST_ACTIVITY__?.startedAt,
       finishedAt: new Date().toISOString(),
       status: "succeeded",
-      pid: res.pid,
-      elapsedMs: res.elapsedMs,
-      stdoutTail: res.stdoutTail,
-      searchEligibility,
-      eligibilityCompanyMatch,
-      ...(recipientInformation != null ? { recipientInformation } : {}),
-      billingAuth,
-      ...(lookupData != null ? { lookupData } : {}),
-      ...(nonEncounterTaskAdd != null ? { nonEncounterTaskAdd } : {}),
-    };
-    return {
-      ok: true,
-      elapsedMs: res.elapsedMs,
-      pid: res.pid,
-      stdoutTail: res.stdoutTail,
-      billingAuth,
+      step: "parseEligibility",
       ...(searchEligibility != null ? { searchEligibility } : {}),
       ...(eligibilityCompanyMatch != null ? { eligibilityCompanyMatch } : {}),
       ...(recipientInformation != null ? { recipientInformation } : {}),
-      ...(lookupData != null ? { lookupData } : {}),
-      ...(nonEncounterTaskAdd != null ? { nonEncounterTaskAdd } : {}),
+      ...(screenshotPath ? { screenshotPath } : {}),
+    };
+
+    return {
+      ok: true,
+      ...(searchEligibility != null ? { searchEligibility } : {}),
+      ...(eligibilityCompanyMatch != null ? { eligibilityCompanyMatch } : {}),
+      ...(recipientInformation != null ? { recipientInformation } : {}),
+      screenshotPath: screenshotPath ?? null,
     };
   } finally {
     await releaseOhidRunLock(runLock);
   }
+}
+
+/**
+ * Step 3: BillingAuth token (env-configured).
+ */
+export async function ohidFetchBillingAuth() {
+  const auth = await fetchBillingAuthFromEnv();
+  if ("skipped" in auth && auth.skipped) return { skipped: true, reason: auth.reason };
+  if ("ok" in auth && auth.ok && "token" in auth) return { ok: true, token: auth.token };
+  if ("ok" in auth && !auth.ok) return { ok: false, error: auth.error, ...(auth.status != null ? { status: auth.status } : {}) };
+  return { ok: false, error: "Unexpected BillingAuth response" };
+}
+
+/**
+ * Step 4: lookup data with BillingAuth token.
+ */
+export async function ohidFetchLookupData(input) {
+  const jwt = typeof input?.jwt === "string" ? input.jwt : "";
+  if (!jwt) {
+    return { taskCategories: { ok: false, error: "Missing JWT" }, priorities: { ok: false, error: "Missing JWT" } };
+  }
+  return await fetchBillingLookupDataWithToken(jwt);
+}
+
+/**
+ * Step 5: add non-encounter task with screenshot (optional).
+ */
+export async function ohidAddNonEncounterTask(input) {
+  const jwt = typeof input?.jwt === "string" ? input.jwt : "";
+  const firstNameMi = typeof input?.firstNameMi === "string" ? input.firstNameMi.trim() : "";
+  const screenshotPath = typeof input?.screenshotPath === "string" ? input.screenshotPath : "";
+  if (!jwt) return { ok: false, error: "Missing billing JWT" };
+  if (!firstNameMi) return { ok: false, error: "Missing recipientInformation.firstNameMi" };
+
+  const patientIdRaw =
+    (process.env.NON_ENCOUNTER_TASK_PATIENT_ID || process.env.BILLING_TASK_PATIENT_ID || "").trim();
+  const patientId = /^\d+$/.test(patientIdRaw) ? Number(patientIdRaw) : null;
+
+  const assignedToRoleIdRaw = (process.env.BILLING_TASK_ASSIGNED_TO_ROLE_ID || "7").trim();
+  const assignedToRoleId = /^\d+$/.test(assignedToRoleIdRaw) ? Number(assignedToRoleIdRaw) : 7;
+
+  const priorityIdRaw = (process.env.BILLING_TASK_PRIORITY_ID || "1").trim();
+  const priorityId = /^\d+$/.test(priorityIdRaw) ? Number(priorityIdRaw) : 1;
+
+  const taskTypeCode = (process.env.BILLING_TASK_TYPE_CODE || "BILLING_NOTE").trim() || "BILLING_NOTE";
+
+  const now = new Date();
+  const dueAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(); // +1 day default
+
+  // New v3 DTO shape (used when BILLING_TENANT_ID is configured).
+  const dto = {
+    title: `Eligibility check – ${firstNameMi}`,
+    description: "Automated eligibility check created from OHID workflow.",
+    taskTypeCode,
+    priorityId,
+    assignedToRoleId,
+    ...(patientId != null ? { patientId } : {}),
+    dueAt,
+    notes: [
+      {
+        id: 0,
+        taskId: 0,
+        noteText: "Created by automation (OHID workflow).",
+        createdBy: process.env.BILLING_TASK_CREATED_BY || "automation@local",
+        createdDate: new Date().toISOString(),
+      },
+    ],
+  };
+
+  // Legacy endpoint supports screenshot upload; v3 currently does not in this repo.
+  const filePaths = screenshotPath && existsSync(screenshotPath) ? [screenshotPath] : [];
+  return await addNonEncounterTaskWithToken(jwt, dto, { filePaths });
+}
+
+/**
+ * Back-compat wrapper: keep existing activity name but implement it via the new steps.
+ * (Some clients/workflows may still reference `runOhidLogin`.)
+ */
+export async function runOhidLogin(input) {
+  const runId = input?.runId ? String(input.runId) : "";
+  const play = await ohidRunPlaywright(input);
+  const parsed = await ohidParseEligibility({ runId, stdoutTail: play.stdoutTail });
+
+  const eligibilityCompanyMatch = parsed?.eligibilityCompanyMatch ?? null;
+  const companyNameMatched =
+    eligibilityCompanyMatch != null &&
+    typeof eligibilityCompanyMatch === "object" &&
+    "match" in eligibilityCompanyMatch &&
+    eligibilityCompanyMatch.match === true;
+
+  /** @type {{ ok: true; token: string } | { ok: false; error: string; status?: number } | { skipped: true; reason: string }} */
+  let billingAuth = { skipped: true, reason: "BillingAuth not run yet" };
+  /** @type {{ taskCategories: unknown; priorities: unknown } | null} */
+  let lookupData = null;
+  /** @type {unknown | null} */
+  let nonEncounterTaskAdd = null;
+
+  if (!companyNameMatched) {
+    const reason =
+      eligibilityCompanyMatch == null
+        ? "Company match not evaluated (provide medicateSearch.companyName); BillingAuth / LookupData / NonEncounterTask not called."
+        : "Company name did not match; BillingAuth / LookupData / NonEncounterTask not called.";
+    billingAuth = { skipped: true, reason };
+    nonEncounterTaskAdd = { skipped: true, reason };
+  } else {
+    billingAuth = await ohidFetchBillingAuth();
+    const jwt =
+      billingAuth && typeof billingAuth === "object" && "ok" in billingAuth && billingAuth.ok && typeof billingAuth.token === "string"
+        ? billingAuth.token
+        : null;
+    if (jwt) {
+      lookupData = await ohidFetchLookupData({ jwt });
+      const firstNameMi =
+        parsed?.recipientInformation != null &&
+        typeof parsed.recipientInformation === "object" &&
+        "firstNameMi" in parsed.recipientInformation &&
+        typeof parsed.recipientInformation.firstNameMi === "string"
+          ? parsed.recipientInformation.firstNameMi
+          : "";
+      nonEncounterTaskAdd = await ohidAddNonEncounterTask({
+        jwt,
+        firstNameMi,
+        screenshotPath: parsed?.screenshotPath ?? "",
+      });
+    } else {
+      nonEncounterTaskAdd = { ok: false, error: "Missing billing JWT" };
+    }
+  }
+
+  return {
+    ok: true,
+    elapsedMs: play.elapsedMs,
+    pid: play.pid,
+    stdoutTail: play.stdoutTail,
+    billingAuth,
+    ...(parsed?.searchEligibility != null ? { searchEligibility: parsed.searchEligibility } : {}),
+    ...(parsed?.eligibilityCompanyMatch != null ? { eligibilityCompanyMatch: parsed.eligibilityCompanyMatch } : {}),
+    ...(parsed?.recipientInformation != null ? { recipientInformation: parsed.recipientInformation } : {}),
+    ...(lookupData != null ? { lookupData } : {}),
+    ...(nonEncounterTaskAdd != null ? { nonEncounterTaskAdd } : {}),
+  };
 }

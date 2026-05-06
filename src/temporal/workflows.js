@@ -41,6 +41,21 @@ const { runOhidLogin } = proxyActivities({
   },
 });
 
+const {
+  ohidPlaywrightLogin,
+  ohidPlaywrightEligibility,
+  ohidParseEligibility,
+  ohidFetchBillingAuth,
+  ohidFetchLookupData,
+  ohidAddNonEncounterTask,
+} =
+  proxyActivities({
+    startToCloseTimeout: "20 minutes",
+    retry: {
+      maximumAttempts: 1,
+    },
+  });
+
 /**
  * @param {Record<string, never>} _input
  * @returns {Promise<{ success: boolean }>}
@@ -155,13 +170,69 @@ export async function ohidLoginWorkflow(input) {
     inputCompanyName: medicateSearch?.companyName ?? null,
   });
 
-  const __ohidActivityResult = await runOhidLogin({ runId, medicateSearch });
-  log.info("ohidLoginWorkflow: runOhidLogin completed");
+  // Split into multiple activities so Temporal Event History shows clear phases.
+  await ohidPlaywrightLogin({ runId });
+  // Keep PNM + Eligibility as ONE Temporal activity event.
+  // The eligibility step will resume via run-state (lastUrl) when available,
+  // otherwise it falls back to normal navigation (My Apps → Open PNM → Eligibility).
+  const __play = await ohidPlaywrightEligibility({ runId, medicateSearch });
+  const __parsed = await ohidParseEligibility({ runId, stdoutTail: __play.stdoutTail });
 
-  const __billingAuth =
-    __ohidActivityResult?.billingAuth != null
-      ? __ohidActivityResult.billingAuth
-      : { skipped: true, reason: "billingAuth missing from activity — restart worker" };
+  const __se = __parsed?.searchEligibility ?? null;
+  const __recipient = __parsed?.recipientInformation ?? null;
+  const __em =
+    __parsed?.eligibilityCompanyMatch ??
+    (__se && typeof __se === "object" ? __se.companyMatch : null) ??
+    null;
+
+  const companyNameMatched =
+    __em != null && typeof __em === "object" && "match" in __em && __em.match === true;
+
+  /** @type {{ ok: true; token: string } | { ok: false; error: string; status?: number } | { skipped: true; reason: string }} */
+  let __billingAuth = { skipped: true, reason: "BillingAuth not run yet" };
+  /** @type {{ taskCategories: unknown; priorities: unknown } | null} */
+  let __lookup = null;
+  /** @type {unknown | null} */
+  let __nonEncounterTaskAdd = null;
+
+  if (!companyNameMatched) {
+    __billingAuth = {
+      skipped: true,
+      reason:
+        __em == null
+          ? "Company match not evaluated (provide medicateSearch.companyName); BillingAuth / LookupData / NonEncounterTask not called."
+          : "Company name did not match; BillingAuth / LookupData / NonEncounterTask not called.",
+    };
+    __nonEncounterTaskAdd = { skipped: true, reason: __billingAuth.reason };
+  } else {
+    __billingAuth = await ohidFetchBillingAuth();
+    const jwt =
+      __billingAuth != null &&
+      typeof __billingAuth === "object" &&
+      "ok" in __billingAuth &&
+      __billingAuth.ok &&
+      "token" in __billingAuth &&
+      typeof __billingAuth.token === "string"
+        ? __billingAuth.token
+        : null;
+    if (jwt) {
+      __lookup = await ohidFetchLookupData({ jwt });
+      const firstNameMi =
+        __recipient != null &&
+        typeof __recipient === "object" &&
+        "firstNameMi" in __recipient &&
+        typeof __recipient.firstNameMi === "string"
+          ? __recipient.firstNameMi
+          : "";
+      __nonEncounterTaskAdd = await ohidAddNonEncounterTask({
+        jwt,
+        firstNameMi,
+        screenshotPath: __parsed?.screenshotPath ?? "",
+      });
+    } else {
+      __nonEncounterTaskAdd = { ok: false, error: "Missing billing JWT" };
+    }
+  }
 
   if (typeof __billingAuth === "object" && "ok" in __billingAuth && __billingAuth.ok) {
     log.info("Workflow result (BillingAuth JWT)", { ok: true, tokenLength: __billingAuth.token?.length ?? 0 });
@@ -170,13 +241,6 @@ export async function ohidLoginWorkflow(input) {
   } else if (typeof __billingAuth === "object" && "ok" in __billingAuth && !__billingAuth.ok) {
     log.info("Workflow result (BillingAuth JWT)", { ok: false, error: __billingAuth.error });
   }
-
-  const __se = __ohidActivityResult?.searchEligibility ?? null;
-  const __recipient = __ohidActivityResult?.recipientInformation ?? null;
-  const __em =
-    __ohidActivityResult?.eligibilityCompanyMatch ??
-    (__se && typeof __se === "object" ? __se.companyMatch : null) ??
-    null;
 
   if (__se != null && typeof __se === "object") {
     log.info("Workflow result (Search Eligibility JSON)", {
@@ -202,20 +266,6 @@ export async function ohidLoginWorkflow(input) {
     "token" in __billingAuth &&
     typeof __billingAuth.token === "string"
       ? __billingAuth.token
-      : null;
-
-  const __lookup =
-    __ohidActivityResult != null &&
-    typeof __ohidActivityResult === "object" &&
-    "lookupData" in __ohidActivityResult
-      ? /** @type {{ lookupData?: unknown }} */ (__ohidActivityResult).lookupData
-      : null;
-
-  const __nonEncounterTaskAdd =
-    __ohidActivityResult != null &&
-    typeof __ohidActivityResult === "object" &&
-    "nonEncounterTaskAdd" in __ohidActivityResult
-      ? /** @type {{ nonEncounterTaskAdd?: unknown }} */ (__ohidActivityResult).nonEncounterTaskAdd
       : null;
 
   return {
