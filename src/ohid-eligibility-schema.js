@@ -36,12 +36,20 @@ const RecipientInformationSchema = z.object({
   countyOfficeInformationUrl: z.string().nullable(),
 });
 
+const MagiFirstSearchSummarySchema = z.object({
+  researchRan: z.literal(true),
+  hadMagiMentalHealthUnderBenefitAssignment: z.boolean(),
+  benefitAssignmentPlansChecked: z.number(),
+  message: z.string().optional(),
+});
+
 export const OhidEligibilityStdoutPayloadSchema = z.object({
   recipientInformation: RecipientInformationSchema.optional(),
   benefitAssignmentPlans: z.array(BenefitAssignmentPlanRowSchema),
   managedCarePlans: z.array(ManagedCarePlanRowSchema),
   companyMatch: EligibilityCompanyMatchResultSchema.nullable(),
   extractionWarnings: z.array(z.string()).optional(),
+  magiFirstSearch: MagiFirstSearchSummarySchema.optional(),
 });
 
 /**

@@ -30,6 +30,7 @@
     "@temporalio/workflow": "^1.15.0",
     "express": "^4.21.2",
     "express-rate-limit": "^8.3.2",
+    "openai": "^6.37.0",
     "playwright": "^1.49.1",
     "twilio": "^5.4.0",
     "zod": "^4.3.6"

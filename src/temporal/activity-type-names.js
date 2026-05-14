@@ -11,6 +11,8 @@ export const OHID_ACTIVITY_TYPE = {
   FETCH_BILLING_AUTH: "Connect to billing authorization",
   FETCH_LOOKUP_DATA: "Load task categories and priorities",
   ADD_NON_ENCOUNTER_TASK: "Create non-encounter task",
+  ADD_INSURANCE_POLICY: "Add insurance policy (no MAGI Mental Health)",
+  ADD_PATIENT_STICKY_NOTE: "Generate and post billing note (OpenAI)",
   OPEN_PNM: "Open Plan Management in OHID",
   RUN_PLAYWRIGHT: "OHID browser automation (full script)",
   RUN_OHID_LOGIN: "OHID sign-in and eligibility (single step)",

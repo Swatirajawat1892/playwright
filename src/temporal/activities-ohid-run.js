@@ -9,9 +9,11 @@ import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { safeParseOhidEligibilityStdoutPayload } from "../ohid-eligibility-schema.js";
+import { isMagiMentalHealthUnderBenefitAssignmentPlan } from "../magi-mental-health-assignment.js";
 import { acquireOhidRunLock, releaseOhidRunLock } from "../ohid/run-lock.js";
 import { fetchBillingAuthFromEnv } from "../billing-auth-client.js";
 import { addNonEncounterTaskWithToken, fetchBillingLookupDataWithToken } from "../billing-lookup-data.js";
+import { generateStickyNoteWithOpenAI, postPatientStickyNote } from "../ohid-sticky-note.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..", "..");
@@ -171,12 +173,26 @@ function parseOhidEligibilityResultFromStdout(stdout) {
   if (typeof stdout !== "string" || !stdout.includes(OHID_ELIGIBILITY_RESULT_PREFIX)) {
     return undefined;
   }
-  const start = stdout.indexOf(OHID_ELIGIBILITY_RESULT_PREFIX);
-  const end = stdout.indexOf(OHID_ELIGIBILITY_RESULT_SUFFIX, start + OHID_ELIGIBILITY_RESULT_PREFIX.length);
-  if (end === -1) {
+  // Multiple markers possible (e.g. initial search + DOS −1 month retry); use the last complete block.
+  let searchFrom = 0;
+  let lastStart = -1;
+  let lastEnd = -1;
+  for (;;) {
+    const start = stdout.indexOf(OHID_ELIGIBILITY_RESULT_PREFIX, searchFrom);
+    if (start === -1) break;
+    const end = stdout.indexOf(
+      OHID_ELIGIBILITY_RESULT_SUFFIX,
+      start + OHID_ELIGIBILITY_RESULT_PREFIX.length,
+    );
+    if (end === -1) break;
+    lastStart = start;
+    lastEnd = end;
+    searchFrom = end + OHID_ELIGIBILITY_RESULT_SUFFIX.length;
+  }
+  if (lastStart === -1 || lastEnd === -1) {
     return undefined;
   }
-  const jsonStr = stdout.slice(start + OHID_ELIGIBILITY_RESULT_PREFIX.length, end);
+  const jsonStr = stdout.slice(lastStart + OHID_ELIGIBILITY_RESULT_PREFIX.length, lastEnd);
   try {
     const raw = JSON.parse(jsonStr);
     const parsed = safeParseOhidEligibilityStdoutPayload(raw);
@@ -486,7 +502,61 @@ export async function ohidParseEligibility(input) {
       }
     }
 
+    // ── MAGI Mental-Health check (company-name-no-match scenario) ─────────────
+    // When the company name did NOT match (or was never provided), check whether
+    // the patient holds "MAGI: Mental Health Under Benefit/Assignment …" (not e.g. "MAGI: Ohio Mental Health" alone).
+    // Result is included in the return value as `magiMentalHealthCheck`.
+    const _companyMatched =
+      eligibilityCompanyMatch != null &&
+      typeof eligibilityCompanyMatch === "object" &&
+      "match" in eligibilityCompanyMatch &&
+      /** @type {{ match: boolean }} */ (eligibilityCompanyMatch).match === true;
+
+    /** @type {{ checked: boolean, found: boolean, plan: object | null, message: string } | null} */
+    let magiMentalHealthCheck = null;
+
+    if (!_companyMatched && searchEligibility != null) {
+      const _benefitPlans = Array.isArray(searchEligibility.benefitAssignmentPlans)
+        ? searchEligibility.benefitAssignmentPlans
+        : [];
+      const _magiPlan = _benefitPlans.find(
+        (p) =>
+          typeof p?.benefitAssignmentPlan === "string" &&
+          isMagiMentalHealthUnderBenefitAssignmentPlan(p.benefitAssignmentPlan),
+      ) ?? null;
+
+      if (_magiPlan) {
+        const msg =
+          `Company name did not match — patient has MAGI: Mental Health Under Benefit/Assignment Plan` +
+          ` ("${_magiPlan.benefitAssignmentPlan}"; effective: ${_magiPlan.effectiveDate ?? "?"}, end: ${_magiPlan.endDate ?? "?"}).`;
+        console.log(`[OHID][parseEligibility] ${msg}`);
+        magiMentalHealthCheck = { checked: true, found: true, plan: _magiPlan, message: msg };
+      } else {
+        const msg =
+          `Company name did not match — patient does NOT have MAGI: Mental Health Under Benefit/Assignment Plan.` +
+          ` (benefit plans checked: ${_benefitPlans.length})`;
+        console.log(`[OHID][parseEligibility] ${msg}`);
+        magiMentalHealthCheck = { checked: true, found: false, plan: null, message: msg };
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const screenshotPath = await resolveSearchEligibilityScreenshotPath(stdoutTail, runId);
+
+    const magiFirstSearch =
+      searchEligibility != null &&
+      typeof searchEligibility === "object" &&
+      "magiFirstSearch" in searchEligibility &&
+      searchEligibility.magiFirstSearch != null
+        ? searchEligibility.magiFirstSearch
+        : null;
+    const magiFirstSearchMessage =
+      magiFirstSearch != null &&
+      typeof magiFirstSearch === "object" &&
+      "message" in magiFirstSearch &&
+      typeof magiFirstSearch.message === "string"
+        ? magiFirstSearch.message
+        : null;
 
     globalThis.__OHID_LAST_ACTIVITY__ = {
       kind: "ohid",
@@ -498,6 +568,9 @@ export async function ohidParseEligibility(input) {
       ...(searchEligibility != null ? { searchEligibility } : {}),
       ...(eligibilityCompanyMatch != null ? { eligibilityCompanyMatch } : {}),
       ...(recipientInformation != null ? { recipientInformation } : {}),
+      ...(magiMentalHealthCheck != null ? { magiMentalHealthCheck } : {}),
+      ...(magiFirstSearch != null ? { magiFirstSearch } : {}),
+      ...(magiFirstSearchMessage != null ? { magiFirstSearchMessage } : {}),
       ...(screenshotPath ? { screenshotPath } : {}),
     };
 
@@ -506,6 +579,9 @@ export async function ohidParseEligibility(input) {
       ...(searchEligibility != null ? { searchEligibility } : {}),
       ...(eligibilityCompanyMatch != null ? { eligibilityCompanyMatch } : {}),
       ...(recipientInformation != null ? { recipientInformation } : {}),
+      ...(magiMentalHealthCheck != null ? { magiMentalHealthCheck } : {}),
+      ...(magiFirstSearch != null ? { magiFirstSearch } : {}),
+      ...(magiFirstSearchMessage != null ? { magiFirstSearchMessage } : {}),
       screenshotPath: screenshotPath ?? null,
     };
   } finally {
@@ -583,6 +659,137 @@ export async function ohidAddNonEncounterTask(input) {
   // Legacy endpoint supports screenshot upload; v3 currently does not in this repo.
   const filePaths = screenshotPath && existsSync(screenshotPath) ? [screenshotPath] : [];
   return await addNonEncounterTaskWithToken(jwt, dto, { filePaths });
+}
+
+/**
+ * Step 6 (conditional): POST to InsurancePolicy API when the patient has no MAGI Mental Health
+ * benefit/assignment plan.  Patient details are hardcoded for now.
+ *
+ * @param {{ jwt?: string } | null | undefined} input - Bearer from `ohidFetchBillingAuth` (preferred).
+ *
+ * Env (fallback if input.jwt missing):
+ *   ATC_INSURANCE_POLICY_TOKEN  — Bearer token for atc-api.atcemr.com
+ *   ATC_INSURANCE_POLICY_COOKIE — Full Cookie header value (AWSALB=…)
+ *   ATC_INSURANCE_POLICY_URL    — Override API base URL (default: https://atc-api.atcemr.com/api/InsurancePolicy)
+ */
+export async function ohidAddInsurancePolicy(input) {
+  const url = (process.env.ATC_INSURANCE_POLICY_URL || "https://atc-api.atcemr.com/api/InsurancePolicy").trim();
+  const fromInput = typeof input?.jwt === "string" ? input.jwt.trim() : "";
+  const fromEnv = (process.env.ATC_INSURANCE_POLICY_TOKEN || "").trim();
+  const token = fromInput || fromEnv;
+  const cookie = (process.env.ATC_INSURANCE_POLICY_COOKIE || "").trim();
+
+  if (!token) {
+    return {
+      skipped: true,
+      reason:
+        "No Bearer token: pass jwt from BillingAuth or set ATC_INSURANCE_POLICY_TOKEN in .env.",
+    };
+  }
+
+  // Patient details are hardcoded for now.
+  const body = {
+    phSignatureOnFile: true,
+    acceptAssignment: true,
+    insuranceCompanyID: 465,
+    medicaidId: "",
+    policyHolderId: 16759,
+    policyNumber: "444444444444",
+    planEffectiveDate: "10/01/2025",
+    planExpirationDate: "",
+    insurancePolicyHolder: {
+      firstName: "test",
+      lastName: "test",
+      dob: "12/31/1999",
+      genderId: 1,
+      homePhone: "6142199394",
+    },
+    patientPolicy: [
+      {
+        isActive: true,
+        levelId: 1,
+        patientId: "8028",
+      },
+    ],
+  };
+
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+    ...(cookie ? { Cookie: cookie } : {}),
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const text = await res.text().catch(() => "");
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text || null;
+    }
+
+    if (!res.ok) {
+      console.error(`[OHID][InsurancePolicy] HTTP ${res.status}:`, text);
+      return { ok: false, status: res.status, error: `HTTP ${res.status}`, data };
+    }
+
+    console.log(`[OHID][InsurancePolicy] Created successfully (HTTP ${res.status}).`);
+    return { ok: true, status: res.status, data };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    console.error("[OHID][InsurancePolicy] Request failed:", error);
+    return { ok: false, error };
+  }
+}
+
+/**
+ * Step 7 (conditional): Generate a billing note via OpenAI from the eligibility data,
+ * then POST it to PatientStickyNote/Add.  Called when the patient has no MAGI Mental
+ * Health plan (company name did not match).
+ *
+ * @param {{
+ *   jwt?: string,
+ *   recipientInformation?: object | null,
+ *   benefitAssignmentPlans?: object[],
+ *   eligibilityCompanyMatch?: object | null,
+ *   magiMentalHealthCheck?: object | null,
+ * } | null | undefined} input
+ */
+export async function ohidAddPatientStickyNote(input) {
+  const eligibilityData = input ?? {};
+  const billingJwt = typeof eligibilityData.jwt === "string" ? eligibilityData.jwt.trim() : "";
+
+  const notePayload = {
+    recipientInformation: eligibilityData.recipientInformation ?? null,
+    benefitAssignmentPlans: eligibilityData.benefitAssignmentPlans ?? [],
+    eligibilityCompanyMatch: eligibilityData.eligibilityCompanyMatch ?? null,
+    magiMentalHealthCheck: eligibilityData.magiMentalHealthCheck ?? null,
+  };
+
+  log.info("[OHID][StickyNote] Generating billing note via OpenAI (set OPENAI_STICKY_NOTE_TEMPLATE_FALLBACK=1 for template-only fallback)…");
+
+  const generated = await generateStickyNoteWithOpenAI(notePayload);
+
+  if (!generated.ok) {
+    console.error("[OHID][StickyNote] Note generation failed:", generated.error);
+    return { ok: false, step: "generate", error: generated.error };
+  }
+
+  log.info("[OHID][StickyNote] Posting to PatientStickyNote/Add…");
+
+  const posted = await postPatientStickyNote(generated.note, { jwt: billingJwt });
+
+  return {
+    ...posted,
+    note: generated.note,
+    ...(generated.source ? { noteSource: generated.source } : {}),
+  };
 }
 
 /**

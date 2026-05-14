@@ -29,7 +29,7 @@
 import "dotenv/config";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   chromium,
@@ -39,8 +39,11 @@ import {
   type Locator,
   type Page,
 } from "playwright";
-// ✅ NEW CHANGE
-import { reportSearchEligibilityPageData } from "./managed-care-plan-match.js";
+import { benefitPlansHaveMagiMentalHealthAssignmentPlan } from "./magi-mental-health-assignment.js";
+import {
+  buildMagiFirstSearchSummaryForResearch,
+  reportSearchEligibilityPageData,
+} from "./managed-care-plan-match.js";
 import { handleOhidOtpFromStoreIfNeeded } from "./ohid/otp-api.js";
 import { clickPnmLoginWithOhidIfPresent } from "./ohid/pnm-gateway.js";
 import { handlePnmMfaIfPresent } from "./ohid/pnm-mfa.js";
@@ -104,6 +107,58 @@ async function readOhidRunState(): Promise<Record<string, unknown> | null> {
     return JSON.parse(await readFile(p, "utf8")) as Record<string, unknown>;
   } catch {
     return null;
+  }
+}
+
+/**
+ * After saving a screenshot locally, POST it to the PractizingDenialManagement server so it gets
+ * stored in S3 and attached to the ticket that owns this Temporal workflow.
+ *
+ * Requires in .env:
+ *   PRACTIZING_API_URL     — base URL of the main app server (default http://localhost:4000)
+ *   PRACTIZING_PLAYWRIGHT_KEY — must match PLAYWRIGHT_UPLOAD_KEY on the server
+ *
+ * Failures are non-fatal: a warning is logged and the script continues.
+ */
+async function uploadScreenshotToTicket(screenshotPath: string): Promise<void> {
+  const apiUrl = (process.env.PRACTIZING_API_URL ?? "").trim() || "http://localhost:4000";
+  const apiKey = (process.env.PRACTIZING_PLAYWRIGHT_KEY ?? "").trim();
+  const workflowId = ohidRunIdFromEnv();
+
+  if (!apiKey) {
+    console.log("[Upload] PRACTIZING_PLAYWRIGHT_KEY not set — skipping screenshot upload.");
+    return;
+  }
+  if (workflowId === "manual") {
+    console.log("[Upload] No workflow ID (OHID_WORKFLOW_RUN_ID not set) — skipping screenshot upload.");
+    return;
+  }
+
+  console.log(`[Upload] Uploading screenshot to ticket for workflow ${workflowId}…`);
+
+  try {
+    const fileBuffer = await readFile(screenshotPath);
+    const fileName = basename(screenshotPath);
+
+    const formData = new FormData();
+    formData.append("files", new Blob([fileBuffer], { type: "image/png" }), fileName);
+
+    const url = `${apiUrl}/api/internal/tickets/by-workflow/${encodeURIComponent(workflowId)}/attachments`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "x-playwright-key": apiKey },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "(no body)");
+      console.warn(`[Upload] Screenshot upload failed (HTTP ${response.status}): ${body.slice(0, 200)}`);
+    } else {
+      const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+      console.log(`[Upload] Screenshot attached to ticket #${body?.ticketId ?? "unknown"}.`);
+    }
+  } catch (e) {
+    console.warn("[Upload] Screenshot upload error (non-fatal):", e instanceof Error ? e.message : e);
   }
 }
 
@@ -1144,6 +1199,21 @@ function medicateSearchFromEnv(): MedicateSearchFields | null {
   }
 }
 
+/** MM/DD/YYYY → previous calendar month (same page eligibility retry). */
+function subtractOneMonthMmDdYyyy(mmddyyyy: string): string {
+  const parts = mmddyyyy.split("/");
+  let month = parseInt(parts[0] ?? "1", 10);
+  const day = parts[1] ?? "01";
+  let year = parseInt(parts[2] ?? "2000", 10);
+  if (!Number.isFinite(month) || !Number.isFinite(year)) return mmddyyyy;
+  month -= 1;
+  if (month === 0) {
+    month = 12;
+    year -= 1;
+  }
+  return `${String(month).padStart(2, "0")}/${day}/${year}`;
+}
+
 /**
  * PNM may open Search Eligibility in the same tab or another tab — use whichever has the form.
  */
@@ -1484,24 +1554,87 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
     }
   }
 
-  console.log("[OHID] Expanding all accordion panels before screenshot…");
-  await expandAllEligibilityAccordions().catch((e) => {
-    console.warn("[OHID] Could not expand all panels (continuing):", e instanceof Error ? e.message : e);
-  });
+  async function runPostSearchExpandHoldAndReport(
+    magiFirstSearch?: import("./managed-care-plan-match.js").OhidMagiFirstSearchSummary,
+  ): Promise<Awaited<ReturnType<typeof reportSearchEligibilityPageData>>> {
+    console.log("[OHID] Expanding all accordion panels before scrape…");
+    await expandAllEligibilityAccordions().catch((e) => {
+      console.warn("[OHID] Could not expand all panels (continuing):", e instanceof Error ? e.message : e);
+    });
 
-  const holdMs = OH.medicateHoldAfterSearch;
-  if (holdMs > 0) {
-    console.log(`[OHID] Holding ${(holdMs / 1000).toFixed(0)}s on results before Playwright exits…`);
-    await new Promise<void>((r) => setTimeout(r, holdMs));
-    console.log("[OHID] Hold complete.");
+    const holdMs = OH.medicateHoldAfterSearch;
+    if (holdMs > 0) {
+      console.log(`[OHID] Holding ${(holdMs / 1000).toFixed(0)}s on results before scrape…`);
+      await new Promise<void>((r) => setTimeout(r, holdMs));
+      console.log("[OHID] Hold complete.");
+    }
+
+    return await reportSearchEligibilityPageData(
+      formPage,
+      cfg,
+      magiFirstSearch != null ? { magiFirstSearch } : undefined,
+    );
   }
 
-  // BENEFIT/ASSIGNMENT + MANAGED CARE tables → JSON stdout marker for Temporal workflow result
-  // Capture return value so we can use recipientInformation.firstNameMi for the screenshot name.
-  const eligibilityPayload = await reportSearchEligibilityPageData(formPage, cfg).catch((e) => {
-    console.error("[OHID] reportSearchEligibilityPageData:", e instanceof Error ? e.message : e);
-    return null;
-  });
+  let eligibilityPayload = await runPostSearchExpandHoldAndReport();
+
+  // Second search (prior-month DOS) **only** when first scrape: managed-care company did NOT match
+  // AND Benefit/Assignment has no "MAGI: Mental Health Under Benefit/Assignment …" row
+  // (same condition as workflow "Company name did not match — patient does NOT have MAGI: …").
+  const cm0 = eligibilityPayload.companyMatch;
+  const companyNameRequested = String(cfg.companyName ?? "").trim() !== "";
+  const companyNoMatchFirst =
+    cm0 != null &&
+    typeof cm0 === "object" &&
+    "match" in cm0 &&
+    (cm0 as { match: boolean }).match === false &&
+    (companyNameRequested ||
+      String((cm0 as { inputCompanyName?: string }).inputCompanyName ?? "").trim() !== "");
+  const hasMagiMentalHealthAssignmentFirst = benefitPlansHaveMagiMentalHealthAssignmentPlan(
+    eligibilityPayload.benefitAssignmentPlans,
+  );
+  const needsResearch = companyNoMatchFirst && !hasMagiMentalHealthAssignmentFirst;
+
+  if (!needsResearch) {
+    console.log(
+      "[OHID] Research skipped (second search runs only when first search: company did not match AND no MAGI Mental Health Under Benefit/Assignment plan).",
+      JSON.stringify({
+        companyNoMatchFirst,
+        hasMagiMentalHealthAssignmentFirst,
+        match: cm0 && typeof cm0 === "object" && "match" in cm0 ? (cm0 as { match: boolean }).match : null,
+      }),
+    );
+  } else {
+    const rFrom = subtractOneMonthMmDdYyyy(cfg.fromDos);
+    const rTo = subtractOneMonthMmDdYyyy(cfg.toDos);
+    console.log(
+      "[OHID] Research: first search — company did not match and no MAGI Mental Health Under Benefit/Assignment — shifting DOS −1 month and searching again:",
+      rFrom,
+      "–",
+      rTo,
+    );
+    await ensureEligibilitySearchPanelOpen(formPage);
+    await formPage.evaluate(() => window.scrollTo(0, 0)).catch(() => undefined);
+    await new Promise<void>((r) => setTimeout(r, 400));
+    await billingLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+    await fromLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+    await toLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+    await fromLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+    await toLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+    await searchLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+    await fillField(fromLoc, rFrom, "txtFDOS (retry −1 month)");
+    await fillField(toLoc, rTo, "txtTDOS (retry −1 month)");
+    await new Promise<void>((r) => setTimeout(r, 300));
+    await searchLoc.waitFor({ state: "visible", timeout: OH.medicateField });
+    await searchLoc.scrollIntoViewIfNeeded().catch(() => undefined);
+    await searchLoc.click({ timeout: OH.medicateField, force: true });
+    console.log("[OHID] Research — clicked Search (DOS −1 month).");
+    await formPage.waitForLoadState("domcontentloaded", { timeout: OH.medicateAfterSearch }).catch(() => undefined);
+    console.log("[OHID] Research — Search Eligibility re-run done. URL:", formPage.url());
+    eligibilityPayload = await runPostSearchExpandHoldAndReport(
+      buildMagiFirstSearchSummaryForResearch(eligibilityPayload),
+    );
+  }
 
   // After expanding everything, capture the final Search Eligibility screen (full page).
   try {
@@ -1536,6 +1669,10 @@ async function fillSearchEligibilityIfConfigured(appPage: Page): Promise<void> {
     await mkdir(dirname(p), { recursive: true });
     await formPage.screenshot({ path: p, fullPage: true }).catch(() => undefined);
     console.log("[OHID] Saved Search Eligibility screenshot:", p);
+
+    await uploadScreenshotToTicket(p).catch((e) => {
+      console.warn("[Upload] Non-fatal error during screenshot upload:", e instanceof Error ? e.message : e);
+    });
   } catch (e) {
     console.warn(
       "[OHID] Could not write Search Eligibility screenshot (continuing):",

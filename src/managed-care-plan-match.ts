@@ -6,6 +6,7 @@ import type { Page, Locator } from "playwright";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { benefitPlansHaveMagiMentalHealthAssignmentPlan } from "./magi-mental-health-assignment.js";
 
 export const OHID_ELIGIBILITY_RESULT_PREFIX = "__OHID_ELIGIBILITY_RESULT__";
 export const OHID_ELIGIBILITY_RESULT_SUFFIX = "__END__";
@@ -50,6 +51,19 @@ export type RecipientInformation = {
   countyOfficeInformationUrl: string | null;
 };
 
+/**
+ * Snapshot from the **first** eligibility scrape when DOS −1 month research runs
+ * (second scrape overwrites tables; this preserves the finding for Temporal / API consumers).
+ */
+export type OhidMagiFirstSearchSummary = {
+  researchRan: true;
+  /** True only if the strict MAGI Mental Health Under Benefit/Assignment row was present on first scrape. */
+  hadMagiMentalHealthUnderBenefitAssignment: boolean;
+  benefitAssignmentPlansChecked: number;
+  /** User-facing line aligned with `ohidParseEligibility` / workflow messaging. */
+  message?: string;
+};
+
 /** Emitted on stdout between prefix/suffix; parsed by `src/temporal/activities.js`. */
 export type OhidEligibilityStdoutPayload = {
   recipientInformation?: RecipientInformation;
@@ -59,7 +73,46 @@ export type OhidEligibilityStdoutPayload = {
   companyMatch: EligibilityCompanyMatchResult | null;
   /** Non-fatal scrape issues (empty sections still return `[]`). */
   extractionWarnings?: string[];
+  /** Set on the **final** payload when prior-month DOS research ran (see `buildMagiFirstSearchSummaryForResearch`). */
+  magiFirstSearch?: OhidMagiFirstSearchSummary;
 };
+
+/**
+ * Build a summary of Benefit/Assignment + managed-care company state from the **first** scrape,
+ * before Playwright shifts DOS −1 month and searches again.
+ */
+export function buildMagiFirstSearchSummaryForResearch(
+  first: OhidEligibilityStdoutPayload,
+): OhidMagiFirstSearchSummary {
+  const plans = first.benefitAssignmentPlans;
+  const n = plans.length;
+  const had = benefitPlansHaveMagiMentalHealthAssignmentPlan(plans);
+  const cm = first.companyMatch;
+  const companyNoMatch =
+    cm != null &&
+    cm.match === false &&
+    String(cm.inputCompanyName ?? "").trim() !== "";
+
+  let message: string | undefined;
+  if (!had) {
+    if (companyNoMatch) {
+      message =
+        `Company name did not match — patient does NOT have MAGI: Mental Health Under Benefit/Assignment Plan.` +
+        ` (first search; benefit plans checked: ${n})`;
+    } else {
+      message =
+        `Patient does NOT have MAGI: Mental Health Under Benefit/Assignment Plan on the first eligibility search (Benefit/Assignment).` +
+        ` (benefit plans checked: ${n})`;
+    }
+  }
+
+  return {
+    researchRan: true,
+    hadMagiMentalHealthUnderBenefitAssignment: had,
+    benefitAssignmentPlansChecked: n,
+    ...(message ? { message } : {}),
+  };
+}
 
 function normalizeMaybeText(s: string): string {
   return s.replace(/\s+/g, " ").trim();
@@ -397,6 +450,7 @@ async function writeEligibilityArtifactIfEnabled(runId: string, payload: OhidEli
 export async function reportSearchEligibilityPageData(
   formPage: Page,
   cfg: MedicateCfgForCompanyMatch,
+  options?: { magiFirstSearch?: OhidMagiFirstSearchSummary | null },
 ): Promise<OhidEligibilityStdoutPayload> {
   const warnings: string[] = [];
   const runId = (process.env.OHID_WORKFLOW_RUN_ID ?? "").trim();
@@ -424,6 +478,7 @@ export async function reportSearchEligibilityPageData(
       managedCarePlans: managed.rows,
       companyMatch,
       ...(warnings.length ? { extractionWarnings: warnings } : {}),
+      ...(options?.magiFirstSearch != null ? { magiFirstSearch: options.magiFirstSearch } : {}),
     };
 
     emitStdoutMarkerAndLogs(payload);
